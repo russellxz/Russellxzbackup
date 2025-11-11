@@ -1,0 +1,34 @@
+{
+  "name": "skyultraplus-backup",
+  "version": "1.0.0",
+  "description": "Sistema de backup/restauración de VPS (full filesystem) con panel, login y gestión de usuarios.",
+  "main": "index.js",
+  "type": "commonjs",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^9.4.3",
+    "express": "^4.19.2",
+    "express-session": "^1.18.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "author": "Russell xz",
+  "license": "MIT",
+  "keywords": [
+    "backup",
+    "restore",
+    "VPS",
+    "ssh",
+    "tar",
+    "sqlite"
+  ]
+}
