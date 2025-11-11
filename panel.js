@@ -16,9 +16,9 @@ const NICE = parseInt(process.env.BACKUP_NICE || "19", 10);
 const IONICE_CLASS = parseInt(process.env.BACKUP_IONICE_CLASS || "3", 10);
 const SCP_LIMIT_KBPS = parseInt(process.env.SCP_LIMIT_KBPS || "0", 10);
 
-// Solo credenciales por defecto; red NO se preserva (se restaura)
+// Por defecto: preservar SSH (credenciales) y RED del destino; restauración limpia activada
 const PRESERVE_AUTH_DEFAULT = (process.env.PRESERVE_AUTH || "1") === "1";
-const PRESERVE_NET_DEFAULT  = (process.env.PRESERVE_NET  || "0") === "1";
+const PRESERVE_NET_DEFAULT  = (process.env.PRESERVE_NET  || "1") === "1";
 const CLEAN_RESTORE_DEFAULT = (process.env.CLEAN_RESTORE || "1") === "1";
 
 // ===== DB =====
@@ -84,8 +84,8 @@ try { db.prepare("ALTER TABLE restores ADD COLUMN target_server_id INTEGER").run
 try { db.prepare("ALTER TABLE restores ADD COLUMN preserve_auth INTEGER NOT NULL DEFAULT 1").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN note TEXT").run(); } catch {}
 
-const timers = new Map();
-const jobs = new Map();
+const timers = new Map(); // serverId -> setInterval
+const jobs = new Map();   // jobId -> {id,type,server_id,percent,status,logs,started_at,ended_at,extra}
 
 const SCHEDULES = {
   off:   0,
@@ -93,7 +93,7 @@ const SCHEDULES = {
   "6h":  6 * 60 * 60 * 1000,
   "12h": 12 * 60 * 60 * 1000,
   "1d":  24 * 60 * 60 * 1000,
-  "1w":  7 * 24 * 60 * 60 * 1000,
+  "1w":  7 * 24 * 60 * 1000 * 24,
   "15d": 15 * 24 * 60 * 60 * 1000,
   "1m":  30 * 24 * 60 * 60 * 1000,
 };
@@ -105,7 +105,10 @@ function newJob(type, server_id) {
   jobs.set(id, job);
   return job;
 }
-function logJob(job, line) { job.logs.push(`[${new Date().toLocaleTimeString()}] ${line}`); }
+function logJob(job, line) {
+  const msg = `[${new Date().toLocaleTimeString()}] ${line}`;
+  job.logs.push(msg);
+}
 function finishJob(job, ok, add = "") {
   job.status = ok ? "done" : "failed";
   job.percent = ok ? 100 : job.percent;
@@ -132,21 +135,24 @@ function run(cmd, args, opts = {}) {
     child.on("close", code => (code === 0) ? resolve({ code, stdout, stderr }) : reject(Object.assign(new Error(`Command failed: ${cmd} ${args.join(" ")}`), { code, stdout, stderr })));
   });
 }
-function parseScpPercent(line) { const m = line.match(/(\d+)%/); return m ? Math.min(100, Math.max(0, parseInt(m[1], 10))) : null; }
+function parseScpPercent(line) {
+  const m = line.match(/(\d+)%/);
+  return m ? Math.min(100, Math.max(0, parseInt(m[1], 10))) : null;
+}
 
 // ===== Exclusiones =====
-// Auth/SSH solamente
+// Auth/SSH (preservar)
 const EXCLUDE_AUTH = [
   "etc/shadow","etc/shadow-","etc/gshadow","etc/gshadow-",
   "etc/passwd","etc/passwd-","etc/group","etc/group-",
   "etc/ssh/*","root/.ssh/*","home/*/.ssh/*"
 ];
-// Red (opcional, por defecto NO se usa)
+// Red (preservar)
 const EXCLUDE_NET = [
   "etc/netplan/*","etc/network/*","etc/resolv.conf",
   "etc/hostname","etc/hosts","etc/machine-id","etc/fstab"
 ];
-// Fijos mínimos (no son /var): pseudo-FS + snap RO
+// Pseudo-FS y cosas efímeras/RO (no tienen sentido en backup)
 const EXCLUDE_ALWAYS = [
   "proc/*","sys/*","dev/*","run/*","tmp/*","mnt/*","media/*","lost+found","snap/*"
 ];
@@ -255,7 +261,7 @@ async function doBackup(serverRow, job, backupRecordId) {
   logJob(job, `Backup finalizado (${(size/1e9).toFixed(2)} GB)`);
 }
 
-// ===== Restore (solo excluye auth/red si aplica; limpieza --delete) =====
+// ===== Restore (limpio, preservando SSH/RED) =====
 async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PRESERVE_AUTH_DEFAULT, preserveNet = PRESERVE_NET_DEFAULT, cleanMode = CLEAN_RESTORE_DEFAULT }, job) {
   const srv = db.prepare("SELECT * FROM servers WHERE id = ?").get(backupRow.server_id);
   if (!srv) throw new Error("Servidor de origen no encontrado");
@@ -272,9 +278,9 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
   const EX_TAR_RESTORE = buildRestoreExcludeFlags(preserveAuth, preserveNet);
   const EX_RSYNC = buildRsyncExcludeFlags(preserveAuth, preserveNet);
 
-  if (preserveAuth) logJob(job, "Preservando SSH/usuarios.");
-  if (preserveNet)  logJob(job, "Preservando red/hostname.");
-  logJob(job, cleanMode ? "Limpieza activa (rsync --delete)." : "Limpieza desactivada.");
+  if (preserveAuth) logJob(job, "Preservando SSH/usuarios (no se pisan contraseñas/llaves).");
+  if (preserveNet)  logJob(job, "Preservando RED/hostname (no se tocan netplan/hosts/resolv.conf/fstab).");
+  logJob(job, cleanMode ? "Modo limpieza: rsync --delete." : "Modo normal: tar (sin borrar extras).");
 
   logJob(job, `Restaurando en ${targetIP} (${isLocalIP(targetIP) ? "local" : "remoto"})…`);
   job.percent = 5;
@@ -395,7 +401,6 @@ function startTimer(serverRow) {
   db.prepare("UPDATE servers SET next_run = ? WHERE id = ?").run(next, serverRow.id);
 }
 (function bootTimers(){ db.prepare("SELECT * FROM servers").all().forEach(startTimer); })();
-
 // panel.js — Parte 3/4 (API REST)
 
 function createPanelRouter({ ensureAuth } = {}) {
@@ -403,8 +408,10 @@ function createPanelRouter({ ensureAuth } = {}) {
   router.use((req, res, next) => ensureAuth ? ensureAuth(req, res, next) : next());
   router.use(express.json());
 
+  // Página UI
   router.get("/panel", (req, res) => res.type("html").send(renderPanelPage()));
 
+  // ---- Servidores ----
   router.get("/api/servers", (req, res) => {
     const rows = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,last_run,next_run,created_at,updated_at FROM servers ORDER BY id ASC").all();
     res.json({ servers: rows });
@@ -467,6 +474,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ ok: true });
   });
 
+  // ---- Backups ----
   router.post("/api/servers/:id/backup-now", async (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
@@ -508,6 +516,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ ok: true });
   });
 
+  // ---- Restore ----
   router.post("/api/restore", async (req, res) => {
     const { backup_id, mode, ip, ssh_user = "root", ssh_pass, preserve_auth } = req.body || {};
     if (!backup_id) return res.status(400).json({ error: "backup_id requerido" });
@@ -548,12 +557,14 @@ function createPanelRouter({ ensureAuth } = {}) {
     })();
   });
 
+  // Estado de job
   router.get("/api/job/:id", (req, res) => {
     const j = jobs.get(req.params.id);
     if (!j) return res.status(404).json({ error: "Job no encontrado" });
     res.json({ id: j.id, type: j.type, server_id: j.server_id, percent: j.percent, status: j.status, logs: j.logs.slice(-200), started_at: j.started_at, ended_at: j.ended_at });
   });
 
+  // Jobs activos
   router.get("/api/jobs/active", (req, res) => {
     const all = Array.from(jobs.values()).filter(j => j.status === "running").map(j => ({
       id: j.id, type: j.type, server_id: j.server_id, percent: j.percent
@@ -561,6 +572,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ active: all });
   });
 
+  // Historial de restauraciones (por servidor)
   router.get("/api/restores", (req, res) => {
     const sid = +req.query.server_id;
     const rows = db.prepare(`
@@ -578,9 +590,17 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ restores: rows });
   });
 
+  // Borrar registro de restauración (éxito o fallo)
+  router.delete("/api/restores/:id", (req, res) => {
+    const id = +req.params.id;
+    const r = db.prepare("SELECT * FROM restores WHERE id = ?").get(id);
+    if (!r) return res.status(404).json({ error: "Restore no encontrado" });
+    db.prepare("DELETE FROM restores WHERE id = ?").run(id);
+    res.json({ ok: true });
+  });
+
   return router;
 }
-
 // panel.js — Parte 4/4 (UI)
 
 function renderPanelPage() {
@@ -613,7 +633,7 @@ function renderPanelPage() {
 <body>
 <header>
   <img src="https://cdn.russellxz.click/3c8ab72a.png" alt="logo">
-  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">by Russell xz</div></div>
+  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">Preserva SSH y RED por defecto · Limpieza activa</div></div>
   <div style="flex:1"></div>
   <form method="post" action="/logout"><button class="secondary">Salir</button></form>
   <a href="/usuarios"><button class="secondary">Usuarios</button></a>
@@ -637,7 +657,7 @@ function renderPanelPage() {
       </div>
       <div class="row" style="align-self:end"><button onclick="addServer()">Agregar</button></div>
     </div>
-    <div class="small">Requisitos: en este servidor <code>sshpass</code>. En remotos <code>tar</code> y (si quieres limpieza) <code>rsync</code>. Para self-backup usa IP <strong>127.0.0.1</strong> y deja la contraseña vacía.</div>
+    <div class="small">Requisitos: en este servidor <code>sshpass</code>. En remotos <code>tar</code> y (para limpieza) <code>rsync</code>. Self-backup: IP <strong>127.0.0.1</strong> sin contraseña.</div>
   </section>
 
   <section class="card">
@@ -852,7 +872,7 @@ async function loadRestores(server_id){
   box.innerHTML='<div class="small">Cargando...</div>';
   const r=await fetch('/api/restores?server_id='+server_id); const j=await r.json();
   if(!j.restores || !j.restores.length){ box.innerHTML='<div class="small">Aún no hay restauraciones.</div>'; return; }
-  let html='<table><thead><tr><th>ID</th><th>Backup</th><th>Origen → Destino</th><th>Modo</th><th>SSH</th><th>Estado</th><th>Fecha</th></tr></thead><tbody>';
+  let html='<table><thead><tr><th>ID</th><th>Backup</th><th>Origen → Destino</th><th>Modo</th><th>SSH</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
   html+=j.restores.map(x=>{
     const dest = x.mode==='same'
       ? (x.target_label || x.source_label || 'Misma VPS')
@@ -868,6 +888,7 @@ async function loadRestores(server_id){
       <td>\${ssh}</td>
       <td>\${st}</td>
       <td>\${new Date(x.created_at).toLocaleString()}</td>
+      <td><a class="link" href="#" onclick="delRestore(\${x.id}, \${server_id});return false;">Borrar registro</a></td>
     </tr>\`;
   }).join('');
   html+='</tbody></table>';
@@ -877,6 +898,10 @@ async function loadRestores(server_id){
 async function delBackup(id, server_id){
   if(!confirm('¿Borrar este backup?')) return;
   const r=await fetch('/api/backups/'+id,{method:'DELETE'}); if(r.ok) loadBackups(server_id);
+}
+async function delRestore(id, server_id){
+  if(!confirm('¿Borrar este registro de restauración?')) return;
+  const r=await fetch('/api/restores/'+id,{method:'DELETE'}); if(r.ok) loadRestores(server_id);
 }
 
 function fillRestoreServers(){
@@ -899,7 +924,7 @@ function toggleRestoreMode(){
 async function restore(){
   const backup_id=document.getElementById('restore_backup').value;
   const mode=document.getElementById('restore_mode').value;
-  const body={ backup_id, mode }; // preserve_auth = true por backend; red no preservada por default
+  const body={ backup_id, mode }; // preserve_auth y preserve_net por defecto se aplican en backend
   if(mode==='other'){
     body.ip=document.getElementById('dst_ip').value;
     body.ssh_user=document.getElementById('dst_user').value || 'root';
