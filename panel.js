@@ -21,6 +21,9 @@ const PRESERVE_AUTH_DEFAULT = (process.env.PRESERVE_AUTH || "1") === "1";
 const PRESERVE_NET_DEFAULT  = (process.env.PRESERVE_NET  || "1") === "1";
 const CLEAN_RESTORE_DEFAULT = (process.env.CLEAN_RESTORE || "1") === "1";
 
+// Barrido de retención periódico (aparte del post-backup)
+const RETENTION_SWEEP_MS = parseInt(process.env.RETENTION_SWEEP_MS || String(6 * 60 * 60 * 1000), 10);
+
 // ===== DB =====
 db.exec(`
   PRAGMA foreign_keys = ON;
@@ -34,6 +37,8 @@ db.exec(`
     schedule_key TEXT NOT NULL DEFAULT 'off',
     interval_ms  INTEGER NOT NULL DEFAULT 0,
     enabled      INTEGER NOT NULL DEFAULT 0,
+    retention_key TEXT NOT NULL DEFAULT 'off',
+    retention_ms  INTEGER NOT NULL DEFAULT 0,
     last_run     TEXT,
     next_run     TEXT,
     created_at   TEXT NOT NULL DEFAULT (datetime('now')),
@@ -80,9 +85,12 @@ db.exec(`
   END;
 `);
 
+// Migraciones suaves (try/catch)
 try { db.prepare("ALTER TABLE restores ADD COLUMN target_server_id INTEGER").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN preserve_auth INTEGER NOT NULL DEFAULT 1").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN note TEXT").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN retention_key TEXT NOT NULL DEFAULT 'off'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN retention_ms INTEGER NOT NULL DEFAULT 0").run(); } catch {}
 
 const timers = new Map(); // serverId -> setInterval
 const jobs = new Map();   // jobId -> {id,type,server_id,percent,status,logs,started_at,ended_at,extra}
@@ -93,9 +101,25 @@ const SCHEDULES = {
   "6h":  6 * 60 * 60 * 1000,
   "12h": 12 * 60 * 60 * 1000,
   "1d":  24 * 60 * 60 * 1000,
-  "1w":  7 * 24 * 60 * 1000 * 24,
+  "1w":  7  * 24 * 60 * 60 * 1000,
   "15d": 15 * 24 * 60 * 60 * 1000,
   "1m":  30 * 24 * 60 * 60 * 1000,
+};
+
+// Retenciones fijas por tiempo + dinámicas en base al schedule
+const RETENTION_KEYS = {
+  off: 0,
+  "1d":  1  * 24 * 60 * 60 * 1000,
+  "3d":  3  * 24 * 60 * 60 * 1000,
+  "7d":  7  * 24 * 60 * 60 * 1000,
+  "15d": 15 * 24 * 60 * 60 * 1000,
+  "30d": 30 * 24 * 60 * 60 * 1000,
+  "60d": 60 * 24 * 60 * 60 * 1000,
+  "90d": 90 * 24 * 60 * 60 * 1000,
+  "180d":180* 24 * 60 * 60 * 1000,
+  // dinámicas: schedxN => N * interval_ms
+  "schedx3": -3,
+  "schedx7": -7,
 };
 
 // ===== Jobs =====
@@ -118,6 +142,15 @@ function finishJob(job, ok, add = "") {
 
 // ===== Helpers =====
 function msFromKey(key = "off") { return SCHEDULES[key] ?? 0; }
+function retentionMsFromKey(key = "off", intervalMs = 0) {
+  if (!key || key === "off") return 0;
+  if (RETENTION_KEYS[key] && RETENTION_KEYS[key] > 0) return RETENTION_KEYS[key];
+  if (key.startsWith("schedx")) {
+    const n = parseInt(key.replace("schedx", ""), 10);
+    return intervalMs > 0 && !Number.isNaN(n) ? n * intervalMs : 0;
+  }
+  return 0;
+}
 function computeNextRun(intervalMs, from = Date.now()) { return intervalMs ? new Date(from + intervalMs).toISOString() : null; }
 function ensureServerDir(serverId) {
   const dir = path.join(BACKUP_DIR, `server_${serverId}`);
@@ -175,7 +208,37 @@ function buildRsyncExcludeFlags(preserveAuth, preserveNet){
   if (preserveNet)  arr = arr.concat(EXCLUDE_NET);
   return arr.map(p=>`--exclude='${p}'`).join(" ");
 }
-// panel.js — Parte 2/4 (backup + restore + scheduler)
+// panel.js — Parte 2/4 (backup + restore + scheduler + retention)
+
+// ===== Limpieza por retención =====
+function cleanupBackupsForServer(serverRow, job = null) {
+  const { id: server_id, retention_key, interval_ms } = serverRow;
+  const effMs = retentionMsFromKey(retention_key, interval_ms);
+  if (!effMs || effMs <= 0) return { deleted: 0 };
+
+  const cutoff = Date.now() - effMs;
+  const list = db.prepare("SELECT id, filename, created_at FROM backups WHERE server_id = ? AND status = 'done' ORDER BY id ASC").all(server_id);
+  let deleted = 0;
+  for (const b of list) {
+    const created = Date.parse(b.created_at);
+    if (!Number.isFinite(created)) continue;
+    if (created < cutoff) {
+      const file = path.join(ensureServerDir(server_id), b.filename);
+      try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+      db.prepare("DELETE FROM backups WHERE id = ?").run(b.id);
+      deleted++;
+      if (job) logJob(job, `Retención: eliminado backup viejo #${b.id} (${b.filename}).`);
+    }
+  }
+  if (job && deleted === 0) logJob(job, `Retención: no había backups para eliminar.`);
+  return { deleted };
+}
+
+// barrido global periódico
+setInterval(() => {
+  const servers = db.prepare("SELECT * FROM servers ORDER BY id ASC").all();
+  for (const s of servers) cleanupBackupsForServer(s);
+}, RETENTION_SWEEP_MS);
 
 // ===== Backup =====
 async function doBackup(serverRow, job, backupRecordId) {
@@ -256,6 +319,15 @@ async function doBackup(serverRow, job, backupRecordId) {
   const size = fs.statSync(localFile).size;
   db.prepare(`UPDATE backups SET size_bytes = ?, status = 'done' WHERE id = ?`).run(size, backupRecordId);
   db.prepare(`UPDATE servers SET last_run = datetime('now') WHERE id = ?`).run(server_id);
+
+  // retención post-backup
+  try {
+    const rowNow = db.prepare("SELECT * FROM servers WHERE id = ?").get(server_id);
+    const { deleted } = cleanupBackupsForServer(rowNow, job);
+    if (deleted > 0) logJob(job, `Retención post-backup: ${deleted} eliminados.`);
+  } catch (e) {
+    logJob(job, `Retención post-backup falló: ${e.message || e}`);
+  }
 
   job.percent = 100;
   logJob(job, `Backup finalizado (${(size/1e9).toFixed(2)} GB)`);
@@ -391,6 +463,8 @@ function startTimer(serverRow) {
       finishJob(job, false, `Error: ${e.message}`);
       db.prepare(`UPDATE backups SET status = 'failed' WHERE server_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1`).run(row.id);
     } finally {
+      // retención periódica extra (por si no hubo backup)
+      try { cleanupBackupsForServer(row, null); } catch {}
       const next2 = computeNextRun(intervalMs);
       db.prepare("UPDATE servers SET next_run = ?, last_run = COALESCE(last_run, datetime('now')) WHERE id = ?").run(next2, row.id);
     }
@@ -401,6 +475,7 @@ function startTimer(serverRow) {
   db.prepare("UPDATE servers SET next_run = ? WHERE id = ?").run(next, serverRow.id);
 }
 (function bootTimers(){ db.prepare("SELECT * FROM servers").all().forEach(startTimer); })();
+
 // panel.js — Parte 3/4 (API REST)
 
 function createPanelRouter({ ensureAuth } = {}) {
@@ -413,24 +488,32 @@ function createPanelRouter({ ensureAuth } = {}) {
 
   // ---- Servidores ----
   router.get("/api/servers", (req, res) => {
-    const rows = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,last_run,next_run,created_at,updated_at FROM servers ORDER BY id ASC").all();
+    const rows = db.prepare(`
+      SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run,created_at,updated_at
+      FROM servers ORDER BY id ASC
+    `).all();
     res.json({ servers: rows });
   });
 
   router.post("/api/servers", (req, res) => {
-    const { label = "", ip = "", ssh_user = "root", ssh_pass = "", schedule_key = "off", enabled = false } = req.body || {};
+    const { label = "", ip = "", ssh_user = "root", ssh_pass = "", schedule_key = "off", enabled = false, retention_key = "off" } = req.body || {};
     if (!ip || (!isLocalIP(ip) && !ssh_pass)) return res.status(400).json({ error: "ip y ssh_pass son requeridos (127.0.0.1 no usa ssh_pass)" });
+
     const interval_ms = msFromKey(schedule_key);
+    const retention_ms = retentionMsFromKey(retention_key, interval_ms);
     const next_run = interval_ms ? computeNextRun(interval_ms) : null;
+
     const info = db.prepare(`
-      INSERT INTO servers (label, ip, ssh_user, ssh_pass, schedule_key, interval_ms, enabled, next_run)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(label.trim(), ip.trim(), (ssh_user || "root").trim(), ssh_pass, schedule_key, interval_ms, enabled ? 1 : 0, next_run);
+      INSERT INTO servers (label, ip, ssh_user, ssh_pass, schedule_key, interval_ms, enabled, retention_key, retention_ms, next_run)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(label.trim(), ip.trim(), (ssh_user || "root").trim(), ssh_pass, schedule_key, interval_ms, enabled ? 1 : 0, retention_key, retention_ms, next_run);
+
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(info.lastInsertRowid);
     startTimer(row);
     res.json({ server: {
       id: row.id, label: row.label, ip: row.ip, ssh_user: row.ssh_user,
       schedule_key: row.schedule_key, interval_ms: row.interval_ms, enabled: !!row.enabled,
+      retention_key: row.retention_key, retention_ms: row.retention_ms,
       last_run: row.last_run, next_run: row.next_run
     }});
   });
@@ -440,15 +523,26 @@ function createPanelRouter({ ensureAuth } = {}) {
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
     if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
 
-    const { schedule_key, enabled, label } = req.body || {};
+    const { schedule_key, enabled, label, retention_key } = req.body || {};
     const updates = [], params = [];
+
     if (typeof label === "string") { updates.push("label = ?"); params.push(label); }
+
+    let interval_ms = row.interval_ms;
     if (typeof schedule_key === "string") {
-      const interval_ms = msFromKey(schedule_key);
+      interval_ms = msFromKey(schedule_key);
       updates.push("schedule_key = ?", "interval_ms = ?", "next_run = ?");
       params.push(schedule_key, interval_ms, interval_ms ? computeNextRun(interval_ms) : null);
     }
+
+    if (typeof retention_key === "string") {
+      const retention_ms = retentionMsFromKey(retention_key, interval_ms);
+      updates.push("retention_key = ?", "retention_ms = ?");
+      params.push(retention_key, retention_ms);
+    }
+
     if (typeof enabled === "boolean") { updates.push("enabled = ?"); params.push(enabled ? 1 : 0); }
+
     if (!updates.length) return res.json({ ok: true });
 
     db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
@@ -457,6 +551,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ server: {
       id: updated.id, label: updated.label, ip: updated.ip, ssh_user: updated.ssh_user,
       schedule_key: updated.schedule_key, interval_ms: updated.interval_ms, enabled: !!updated.enabled,
+      retention_key: updated.retention_key, retention_ms: updated.retention_ms,
       last_run: updated.last_run, next_run: updated.next_run
     }});
   });
@@ -491,6 +586,15 @@ function createPanelRouter({ ensureAuth } = {}) {
       try { await doBackup(row, job, ins.lastInsertRowid); finishJob(job, true, "Backup manual finalizado."); }
       catch (e) { finishJob(job, false, `Error: ${e.message}`); db.prepare(`UPDATE backups SET status = 'failed' WHERE id = ?`).run(ins.lastInsertRowid); }
     })();
+  });
+
+  // Limpieza manual por retención
+  router.post("/api/servers/:id/cleanup", (req, res) => {
+    const id = +req.params.id;
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+    const { deleted } = cleanupBackupsForServer(row);
+    res.json({ ok: true, deleted });
   });
 
   router.get("/api/backups", (req, res) => {
@@ -633,7 +737,7 @@ function renderPanelPage() {
 <body>
 <header>
   <img src="https://cdn.russellxz.click/3c8ab72a.png" alt="logo">
-  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">Preserva SSH y RED por defecto · Limpieza activa</div></div>
+  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">Preserva SSH y RED por defecto · Limpieza activa + Retención</div></div>
   <div style="flex:1"></div>
   <form method="post" action="/logout"><button class="secondary">Salir</button></form>
   <a href="/usuarios"><button class="secondary">Usuarios</button></a>
@@ -653,6 +757,22 @@ function renderPanelPage() {
           <option value="off">Apagado</option><option value="1h">Cada 1 hora</option><option value="6h">Cada 6 horas</option>
           <option value="12h">Cada 12 horas</option><option value="1d">Cada día</option><option value="1w">Cada semana</option>
           <option value="15d">Cada 15 días</option><option value="1m">Cada mes</option>
+        </select>
+      </div>
+      <div class="row">
+        <label>Retención (auto-eliminar backups viejos)</label>
+        <select id="retention_key">
+          <option value="off">No borrar automáticamente</option>
+          <option value="1d">≥ 1 día</option>
+          <option value="3d">≥ 3 días</option>
+          <option value="7d">≥ 7 días</option>
+          <option value="15d">≥ 15 días</option>
+          <option value="30d">≥ 30 días</option>
+          <option value="60d">≥ 60 días</option>
+          <option value="90d">≥ 90 días</option>
+          <option value="180d">≥ 180 días</option>
+          <option value="schedx3">≥ 3× del programa</option>
+          <option value="schedx7">≥ 7× del programa</option>
         </select>
       </div>
       <div class="row" style="align-self:end"><button onclick="addServer()">Agregar</button></div>
@@ -703,6 +823,15 @@ let restoreJobId = null;
 function fmt(dt){ if(!dt) return "-"; return new Date(dt).toLocaleString(); }
 function left(ms){ if(ms<=0) return "00:00:00"; const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,"0"); const m=String(Math.floor((s%3600)/60)).padStart(2,"0"); const ss=String(s%60).padStart(2,"0"); return \`\${h}:\${m}:\${ss}\`; }
 
+function humanRetention(k){
+  const map = {
+    off:"No borrar",
+    "1d":"≥ 1 día","3d":"≥ 3 días","7d":"≥ 7 días","15d":"≥ 15 días","30d":"≥ 30 días",
+    "60d":"≥ 60 días","90d":"≥ 90 días","180d":"≥ 180 días","schedx3":"≥ 3× del programa","schedx7":"≥ 7× del programa"
+  };
+  return map[k] || k || "off";
+}
+
 async function loadServers(){ 
   const r=await fetch('/api/servers'); const j=await r.json(); 
   servers=j.servers||[]; 
@@ -724,6 +853,7 @@ function renderServers(){
           <div class="small">Usuario: \${s.ssh_user}</div>
           <div class="small">Último: \${fmt(s.last_run)} | Próximo: <span data-next="\${s.next_run || ''}" class="countdown"></span></div>
           <div class="small">Programa: \${s.schedule_key} — Estado: <span class="chip \${s.enabled?'on':'off'}">\${s.enabled?'ON':'OFF'}</span></div>
+          <div class="small">Retención: <strong>\${humanRetention(s.retention_key)}</strong></div>
         </div>
         <div class="flex right">
           <select id="sch_\${s.id}">
@@ -736,9 +866,23 @@ function renderServers(){
             <option value="15d" \${s.schedule_key==='15d'?'selected':''}>Cada 15 días</option>
             <option value="1m" \${s.schedule_key==='1m'?'selected':''}>Cada mes</option>
           </select>
+          <select id="ret_\${s.id}">
+            <option value="off"  \${s.retention_key==='off'?'selected':''}>No borrar</option>
+            <option value="1d"   \${s.retention_key==='1d'?'selected':''}>≥ 1 día</option>
+            <option value="3d"   \${s.retention_key==='3d'?'selected':''}>≥ 3 días</option>
+            <option value="7d"   \${s.retention_key==='7d'?'selected':''}>≥ 7 días</option>
+            <option value="15d"  \${s.retention_key==='15d'?'selected':''}>≥ 15 días</option>
+            <option value="30d"  \${s.retention_key==='30d'?'selected':''}>≥ 30 días</option>
+            <option value="60d"  \${s.retention_key==='60d'?'selected':''}>≥ 60 días</option>
+            <option value="90d"  \${s.retention_key==='90d'?'selected':''}>≥ 90 días</option>
+            <option value="180d" \${s.retention_key==='180d'?'selected':''}>≥ 180 días</option>
+            <option value="schedx3" \${s.retention_key==='schedx3'?'selected':''}>≥ 3× programa</option>
+            <option value="schedx7" \${s.retention_key==='schedx7'?'selected':''}>≥ 7× programa</option>
+          </select>
           <button onclick="saveSched(\${s.id})">Guardar</button>
           <button onclick="toggleServer(\${s.id}, \${!s.enabled})">\${s.enabled?'Desactivar':'Activar'}</button>
           <button onclick="manual(\${s.id})">Backup ahora</button>
+          <button class="secondary" onclick="cleanup(\${s.id})">Limpiar ahora</button>
           <a class="link" href="#" onclick="loadBackups(\${s.id});return false;">Ver backups</a>
           &nbsp;|&nbsp;
           <a class="link" href="#" onclick="loadRestores(\${s.id});return false;">Ver restauraciones</a>
@@ -773,6 +917,7 @@ async function addServer(){
     ssh_user:document.getElementById('ssh_user').value||'root',
     ssh_pass:document.getElementById('ssh_pass').value,
     schedule_key:document.getElementById('schedule_key').value,
+    retention_key:document.getElementById('retention_key').value,
     enabled:true
   };
   const r=await fetch('/api/servers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -781,7 +926,8 @@ async function addServer(){
 }
 async function saveSched(id){
   const key=document.getElementById('sch_'+id).value;
-  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({schedule_key:key})});
+  const ret=document.getElementById('ret_'+id).value;
+  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({schedule_key:key, retention_key:ret})});
   if(r.ok) loadServers();
 }
 async function toggleServer(id, enabled){
@@ -806,6 +952,13 @@ async function manual(id){
   localStorage.setItem('job_server_'+id, j.job_id);
   document.getElementById('job_'+id).style.display='';
   pollJob(id);
+}
+async function cleanup(id){
+  const r=await fetch('/api/servers/'+id+'/cleanup',{method:'POST'});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'Error'); return; }
+  alert('Limpieza realizada: '+(j.deleted||0)+' backup(s) eliminados.');
+  loadServers();
 }
 async function pollJob(id){
   const jobId=jobsByServer[id] || localStorage.getItem('job_server_'+id);
