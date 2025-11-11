@@ -396,3 +396,539 @@ function startTimer(serverRow) {
 }
 (function bootTimers(){ db.prepare("SELECT * FROM servers").all().forEach(startTimer); })();
 
+// panel.js — Parte 3/4 (API REST)
+
+function createPanelRouter({ ensureAuth } = {}) {
+  const router = express.Router();
+  router.use((req, res, next) => ensureAuth ? ensureAuth(req, res, next) : next());
+  router.use(express.json());
+
+  router.get("/panel", (req, res) => res.type("html").send(renderPanelPage()));
+
+  router.get("/api/servers", (req, res) => {
+    const rows = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,last_run,next_run,created_at,updated_at FROM servers ORDER BY id ASC").all();
+    res.json({ servers: rows });
+  });
+
+  router.post("/api/servers", (req, res) => {
+    const { label = "", ip = "", ssh_user = "root", ssh_pass = "", schedule_key = "off", enabled = false } = req.body || {};
+    if (!ip || (!isLocalIP(ip) && !ssh_pass)) return res.status(400).json({ error: "ip y ssh_pass son requeridos (127.0.0.1 no usa ssh_pass)" });
+    const interval_ms = msFromKey(schedule_key);
+    const next_run = interval_ms ? computeNextRun(interval_ms) : null;
+    const info = db.prepare(`
+      INSERT INTO servers (label, ip, ssh_user, ssh_pass, schedule_key, interval_ms, enabled, next_run)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(label.trim(), ip.trim(), (ssh_user || "root").trim(), ssh_pass, schedule_key, interval_ms, enabled ? 1 : 0, next_run);
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(info.lastInsertRowid);
+    startTimer(row);
+    res.json({ server: {
+      id: row.id, label: row.label, ip: row.ip, ssh_user: row.ssh_user,
+      schedule_key: row.schedule_key, interval_ms: row.interval_ms, enabled: !!row.enabled,
+      last_run: row.last_run, next_run: row.next_run
+    }});
+  });
+
+  router.put("/api/servers/:id", (req, res) => {
+    const id = +req.params.id;
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+
+    const { schedule_key, enabled, label } = req.body || {};
+    const updates = [], params = [];
+    if (typeof label === "string") { updates.push("label = ?"); params.push(label); }
+    if (typeof schedule_key === "string") {
+      const interval_ms = msFromKey(schedule_key);
+      updates.push("schedule_key = ?", "interval_ms = ?", "next_run = ?");
+      params.push(schedule_key, interval_ms, interval_ms ? computeNextRun(interval_ms) : null);
+    }
+    if (typeof enabled === "boolean") { updates.push("enabled = ?"); params.push(enabled ? 1 : 0); }
+    if (!updates.length) return res.json({ ok: true });
+
+    db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
+    const updated = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    startTimer(updated);
+    res.json({ server: {
+      id: updated.id, label: updated.label, ip: updated.ip, ssh_user: updated.ssh_user,
+      schedule_key: updated.schedule_key, interval_ms: updated.interval_ms, enabled: !!updated.enabled,
+      last_run: updated.last_run, next_run: updated.next_run
+    }});
+  });
+
+  router.delete("/api/servers/:id", (req, res) => {
+    const id = +req.params.id;
+    const active = Array.from(jobs.values()).some(j => j.server_id === id && j.status === "running");
+    if (active) return res.status(409).json({ error: "Hay un proceso en ejecución" });
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+    clearTimer(id);
+    db.prepare("DELETE FROM servers WHERE id = ?").run(id);
+    const dir = path.join(BACKUP_DIR, `server_${id}`);
+    try { if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true }); } catch {}
+    res.json({ ok: true });
+  });
+
+  router.post("/api/servers/:id/backup-now", async (req, res) => {
+    const id = +req.params.id;
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+    const already = Array.from(jobs.values()).find(j => j.server_id === id && j.type === "backup" && j.status === "running");
+    if (already) return res.status(409).json({ error: "Ya hay un backup en curso", job_id: already.id });
+
+    const job = newJob("backup", id);
+    const filename = `manual-${new Date().toISOString().replace(/[:.]/g,"-")}.tgz`;
+    const ins = db.prepare(`INSERT INTO backups (server_id, filename, status) VALUES (?,?, 'running')`).run(id, filename);
+    res.json({ job_id: job.id });
+
+    (async () => {
+      try { await doBackup(row, job, ins.lastInsertRowid); finishJob(job, true, "Backup manual finalizado."); }
+      catch (e) { finishJob(job, false, `Error: ${e.message}`); db.prepare(`UPDATE backups SET status = 'failed' WHERE id = ?`).run(ins.lastInsertRowid); }
+    })();
+  });
+
+  router.get("/api/backups", (req, res) => {
+    const sid = +req.query.server_id;
+    const rows = db.prepare("SELECT id, filename, size_bytes, status, created_at FROM backups WHERE server_id = ? ORDER BY id DESC").all(sid);
+    res.json({ backups: rows });
+  });
+
+  router.get("/api/backups/download/:id", (req, res) => {
+    const b = db.prepare("SELECT * FROM backups WHERE id = ?").get(+req.params.id);
+    if (!b) return res.status(404).send("Backup no encontrado");
+    const file = path.join(ensureServerDir(b.server_id), b.filename);
+    if (!fs.existsSync(file)) return res.status(404).send("Archivo no existe");
+    res.download(file);
+  });
+
+  router.delete("/api/backups/:id", (req, res) => {
+    const b = db.prepare("SELECT * FROM backups WHERE id = ?").get(+req.params.id);
+    if (!b) return res.status(404).json({ error: "Backup no encontrado" });
+    const file = path.join(ensureServerDir(b.server_id), b.filename);
+    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch {}
+    db.prepare("DELETE FROM backups WHERE id = ?").run(+req.params.id);
+    res.json({ ok: true });
+  });
+
+  router.post("/api/restore", async (req, res) => {
+    const { backup_id, mode, ip, ssh_user = "root", ssh_pass, preserve_auth } = req.body || {};
+    if (!backup_id) return res.status(400).json({ error: "backup_id requerido" });
+
+    const b = db.prepare("SELECT * FROM backups WHERE id = ?").get(+backup_id);
+    if (!b) return res.status(404).json({ error: "Backup no encontrado" });
+    if (mode !== "same" && (!ip || !ssh_pass)) return res.status(400).json({ error: "Para otra VPS: ip y ssh_pass requeridos" });
+
+    const srcSrv = db.prepare("SELECT * FROM servers WHERE id = ?").get(b.server_id);
+    let target_server_id = null;
+    if (mode === "same") target_server_id = srcSrv?.id || null;
+    else if (ip) target_server_id = (db.prepare("SELECT id FROM servers WHERE ip = ?").get(String(ip).trim())?.id) || null;
+
+    const preserveAuthFlag = typeof preserve_auth === "boolean" ? (preserve_auth ? 1 : 0) : (PRESERVE_AUTH_DEFAULT ? 1 : 0);
+
+    const job = newJob("restore", b.server_id);
+    job.extra.backup_id = b.id;
+
+    const restIns = db.prepare(`
+      INSERT INTO restores (backup_id, server_id_from, mode, target_ip, target_user, target_server_id, preserve_auth, status)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
+    `).run(b.id, b.server_id, mode, mode === "same" ? null : ip, mode === "same" ? null : ssh_user, target_server_id, preserveAuthFlag);
+    job.extra.restore_id = restIns.lastInsertRowid;
+
+    res.json({ job_id: job.id });
+
+    (async () => {
+      try {
+        await doRestore(
+          { backupRow: b, target: mode === "same" ? { mode } : { mode, ip, ssh_user, ssh_pass }, restoreRecordId: restIns.lastInsertRowid, preserveAuth: !!preserveAuthFlag },
+          job
+        );
+        finishJob(job, true, "Restauración completada. Recomiendo reiniciar.");
+      } catch (e) {
+        finishJob(job, false, `Error: ${e.message}`);
+        if (restIns?.lastInsertRowid) db.prepare(`UPDATE restores SET status='failed', note=? WHERE id=?`).run(String(e.message || "error"), restIns.lastInsertRowid);
+      }
+    })();
+  });
+
+  router.get("/api/job/:id", (req, res) => {
+    const j = jobs.get(req.params.id);
+    if (!j) return res.status(404).json({ error: "Job no encontrado" });
+    res.json({ id: j.id, type: j.type, server_id: j.server_id, percent: j.percent, status: j.status, logs: j.logs.slice(-200), started_at: j.started_at, ended_at: j.ended_at });
+  });
+
+  router.get("/api/jobs/active", (req, res) => {
+    const all = Array.from(jobs.values()).filter(j => j.status === "running").map(j => ({
+      id: j.id, type: j.type, server_id: j.server_id, percent: j.percent
+    }));
+    res.json({ active: all });
+  });
+
+  router.get("/api/restores", (req, res) => {
+    const sid = +req.query.server_id;
+    const rows = db.prepare(`
+      SELECT r.id, r.backup_id, r.mode, r.target_ip, r.target_user, r.status, r.created_at, r.preserve_auth, r.note,
+             b.filename,
+             sf.label  AS source_label, sf.ip AS source_ip,
+             st.label  AS target_label, st.ip AS target_ip2
+      FROM restores r
+      JOIN backups b ON b.id = r.backup_id
+      JOIN servers sf ON sf.id = r.server_id_from
+      LEFT JOIN servers st ON st.id = r.target_server_id
+      WHERE r.server_id_from = ?
+      ORDER BY r.id DESC
+    `).all(sid);
+    res.json({ restores: rows });
+  });
+
+  return router;
+}
+
+// panel.js — Parte 4/4 (UI)
+
+function renderPanelPage() {
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>SkyUltraPlus — Panel de Backups</title>
+<style>
+  :root { --bg:#fff; --fg:#0f172a; --muted:#64748b; --ring:#e5e7eb; --primary:#111827; --accent:#2563eb; --ok:#16a34a; --bad:#ef4444; }
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  header{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--ring)}
+  header img{width:40px;height:40px} h1{font-size:18px;margin:0} .sub{font-size:12px;color:var(--muted)}
+  main{max-width:1100px;margin:0 auto;padding:20px;display:grid;gap:18px}
+  .card{border:1px solid var(--ring);border-radius:12px;padding:16px}
+  .row{display:grid;gap:10px} .grid{display:grid;gap:12px} .grid.cols-2{grid-template-columns:1fr 1fr}
+  label{font-size:12px;color:var(--muted)} input,select{width:100%;padding:10px 12px;border:1px solid var(--ring);border-radius:10px;font-size:14px}
+  button{padding:10px 12px;border:none;border-radius:10px;background:var(--primary);color:#fff;font-weight:600;cursor:pointer}
+  button.secondary{background:#334155} button.link{background:transparent;color:var(--accent);padding:0}
+  table{width:100%;border-collapse:collapse} th,td{padding:10px;border-bottom:1px solid var(--ring);text-align:left;font-size:14px}
+  .small{font-size:12px;color:var(--muted)} .chip{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;border:1px solid var(--ring)}
+  .on{background:#ecfdf5;color:#065f46;border-color:#a7f3d0} .off{background:#fef2f2;color:#991b1b;border-color:#fecaca}
+  .bar{height:8px;background:#f1f5f9;border-radius:999px;overflow:hidden} .bar>span{display:block;height:100%;background:linear-gradient(90deg,#60a5fa,#2563eb)}
+  .flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap} .right{justify-content:flex-end}
+  .state{font-weight:700}
+  .ok{color:var(--ok)} .bad{color:var(--bad)}
+</style>
+</head>
+<body>
+<header>
+  <img src="https://cdn.russellxz.click/3c8ab72a.png" alt="logo">
+  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">by Russell xz</div></div>
+  <div style="flex:1"></div>
+  <form method="post" action="/logout"><button class="secondary">Salir</button></form>
+  <a href="/usuarios"><button class="secondary">Usuarios</button></a>
+</header>
+
+<main>
+  <section class="card">
+    <h2 style="margin:0 0 10px;font-size:16px">Agregar VPS</h2>
+    <div class="grid cols-2">
+      <div class="row"><label>Etiqueta (opcional)</label><input id="label" placeholder="Mi VPS #1"></div>
+      <div class="row"><label>IP (usa 127.0.0.1 para self-backup)</label><input id="ip" placeholder="45.90.99.19"></div>
+      <div class="row"><label>Usuario SSH</label><input id="ssh_user" value="root"></div>
+      <div class="row"><label>Contraseña SSH</label><input id="ssh_pass" type="password" placeholder="••••••••"></div>
+      <div class="row">
+        <label>Programa</label>
+        <select id="schedule_key">
+          <option value="off">Apagado</option><option value="1h">Cada 1 hora</option><option value="6h">Cada 6 horas</option>
+          <option value="12h">Cada 12 horas</option><option value="1d">Cada día</option><option value="1w">Cada semana</option>
+          <option value="15d">Cada 15 días</option><option value="1m">Cada mes</option>
+        </select>
+      </div>
+      <div class="row" style="align-self:end"><button onclick="addServer()">Agregar</button></div>
+    </div>
+    <div class="small">Requisitos: en este servidor <code>sshpass</code>. En remotos <code>tar</code> y (si quieres limpieza) <code>rsync</code>. Para self-backup usa IP <strong>127.0.0.1</strong> y deja la contraseña vacía.</div>
+  </section>
+
+  <section class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h2 style="margin:0;font-size:16px">Servidores</h2>
+      <div class="small">Cuenta regresiva al próximo backup.</div>
+    </div>
+    <div id="servers-wrap" class="row"></div>
+  </section>
+
+  <section class="card">
+    <h2 style="margin:0 0 10px;font-size:16px">Restaurar backup</h2>
+    <div class="grid cols-2">
+      <div class="row"><label>Servidor (origen)</label><select id="restore_server"></select></div>
+      <div class="row"><label>Backup</label><select id="restore_backup"></select></div>
+      <div class="row">
+        <label>Destino</label>
+        <select id="restore_mode" onchange="toggleRestoreMode()">
+          <option value="same">Misma VPS</option>
+          <option value="other">Otra VPS</option>
+        </select>
+      </div>
+      <div class="row restore-other" style="display:none"><label>IP destino</label><input id="dst_ip" placeholder="1.2.3.4"></div>
+      <div class="row restore-other" style="display:none"><label>Usuario destino</label><input id="dst_user" value="root"></div>
+      <div class="row restore-other" style="display:none"><label>Contraseña destino</label><input id="dst_pass" type="password" placeholder="••••••••"></div>
+      <div class="row" style="align-self:end"><button onclick="restore()">Restaurar</button></div>
+    </div>
+    <div id="restore_job" class="row" style="margin-top:12px;display:none">
+      <div style="display:flex;gap:10px;align-items:center">
+        <div class="bar" style="flex:1"><span id="restore_bar" style="width:0%"></span></div>
+        <div id="restore_state" class="state small"></div>
+      </div>
+      <div id="restore_log" class="small"></div>
+    </div>
+  </section>
+</main>
+
+<script>
+let servers = []; 
+let jobsByServer = {};
+let restoreJobId = null;
+
+function fmt(dt){ if(!dt) return "-"; return new Date(dt).toLocaleString(); }
+function left(ms){ if(ms<=0) return "00:00:00"; const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,"0"); const m=String(Math.floor((s%3600)/60)).padStart(2,"0"); const ss=String(s%60).padStart(2,"0"); return \`\${h}:\${m}:\${ss}\`; }
+
+async function loadServers(){ 
+  const r=await fetch('/api/servers'); const j=await r.json(); 
+  servers=j.servers||[]; 
+  renderServers(); 
+  fillRestoreServers(); 
+  reattachActiveJobs();
+}
+
+function renderServers(){
+  const wrap=document.getElementById('servers-wrap');
+  if(!servers.length){ wrap.innerHTML='<div class="small">No hay servidores configurados.</div>'; return; }
+  wrap.innerHTML='';
+  servers.forEach(s=>{
+    const row=document.createElement('div'); row.className='row';
+    row.innerHTML=\`
+      <div class="grid cols-2" style="align-items:end">
+        <div class="row">
+          <div><strong>\${s.label || '(sin etiqueta)'} — \${s.ip}</strong></div>
+          <div class="small">Usuario: \${s.ssh_user}</div>
+          <div class="small">Último: \${fmt(s.last_run)} | Próximo: <span data-next="\${s.next_run || ''}" class="countdown"></span></div>
+          <div class="small">Programa: \${s.schedule_key} — Estado: <span class="chip \${s.enabled?'on':'off'}">\${s.enabled?'ON':'OFF'}</span></div>
+        </div>
+        <div class="flex right">
+          <select id="sch_\${s.id}">
+            <option value="off" \${s.schedule_key==='off'?'selected':''}>Apagado</option>
+            <option value="1h" \${s.schedule_key==='1h'?'selected':''}>Cada 1 hora</option>
+            <option value="6h" \${s.schedule_key==='6h'?'selected':''}>Cada 6 horas</option>
+            <option value="12h" \${s.schedule_key==='12h'?'selected':''}>Cada 12 horas</option>
+            <option value="1d" \${s.schedule_key==='1d'?'selected':''}>Cada día</option>
+            <option value="1w" \${s.schedule_key==='1w'?'selected':''}>Cada semana</option>
+            <option value="15d" \${s.schedule_key==='15d'?'selected':''}>Cada 15 días</option>
+            <option value="1m" \${s.schedule_key==='1m'?'selected':''}>Cada mes</option>
+          </select>
+          <button onclick="saveSched(\${s.id})">Guardar</button>
+          <button onclick="toggleServer(\${s.id}, \${!s.enabled})">\${s.enabled?'Desactivar':'Activar'}</button>
+          <button onclick="manual(\${s.id})">Backup ahora</button>
+          <a class="link" href="#" onclick="loadBackups(\${s.id});return false;">Ver backups</a>
+          &nbsp;|&nbsp;
+          <a class="link" href="#" onclick="loadRestores(\${s.id});return false;">Ver restauraciones</a>
+          &nbsp;|&nbsp;
+          <button class="secondary" onclick="delServer(\${s.id})" style="background:#b91c1c">Eliminar VPS</button>
+        </div>
+      </div>
+      <div id="bk_\${s.id}" class="row" style="display:none"></div>
+      <div id="rst_\${s.id}" class="row" style="display:none"></div>
+      <div id="job_\${s.id}" class="row" style="display:none">
+        <div style="display:flex;gap:10px;align-items:center">
+          <div class="bar" style="flex:1"><span id="bar_\${s.id}" style="width:0%"></span></div>
+          <div id="state_\${s.id}" class="state small"></div>
+        </div>
+        <div id="log_\${s.id}" class="small"></div>
+      </div>\`;
+    wrap.appendChild(row);
+  });
+  tickCountdowns();
+}
+
+function tickCountdowns(){
+  const els=document.querySelectorAll('.countdown');
+  els.forEach(el=>{ const nx=el.getAttribute('data-next'); if(!nx){ el.textContent='-'; return; } const ms=new Date(nx)-new Date(); el.textContent=left(ms); });
+  setTimeout(tickCountdowns,1000);
+}
+
+async function addServer(){
+  const body={
+    label:document.getElementById('label').value,
+    ip:document.getElementById('ip').value,
+    ssh_user:document.getElementById('ssh_user').value||'root',
+    ssh_pass:document.getElementById('ssh_pass').value,
+    schedule_key:document.getElementById('schedule_key').value,
+    enabled:true
+  };
+  const r=await fetch('/api/servers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json(); if(!r.ok){ alert(j.error||'Error al agregar'); return; }
+  loadServers();
+}
+async function saveSched(id){
+  const key=document.getElementById('sch_'+id).value;
+  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({schedule_key:key})});
+  if(r.ok) loadServers();
+}
+async function toggleServer(id, enabled){
+  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  if(r.ok) loadServers();
+}
+async function delServer(id){
+  if(!confirm('¿Eliminar esta VPS? Se borrarán configuraciones y backups locales.')) return;
+  const r=await fetch('/api/servers/'+id,{method:'DELETE'});
+  const j=await r.json();
+  if(!r.ok){ alert(j.error||'No se pudo eliminar'); return; }
+  loadServers();
+}
+
+async function manual(id){
+  const r=await fetch('/api/servers/'+id+'/backup-now',{method:'POST'});
+  const j=await r.json(); if(!r.ok){ alert(j.error||'Error'); 
+    if (j.job_id){ localStorage.setItem('job_server_'+id, j.job_id); document.getElementById('job_'+id).style.display=''; pollJob(id); }
+    return; 
+  }
+  jobsByServer[id]=j.job_id; 
+  localStorage.setItem('job_server_'+id, j.job_id);
+  document.getElementById('job_'+id).style.display='';
+  pollJob(id);
+}
+async function pollJob(id){
+  const jobId=jobsByServer[id] || localStorage.getItem('job_server_'+id);
+  if(!jobId) return;
+  const r=await fetch('/api/job/'+jobId); 
+  if(!r.ok){ return; }
+  const j=await r.json();
+  document.getElementById('bar_'+id).style.width=(j.percent||0)+'%';
+  document.getElementById('log_'+id).innerHTML=(j.logs||[]).map(l=>l.replace(/</g,'&lt;')).join('<br>');
+  document.getElementById('job_'+id).style.display='';
+  const stEl=document.getElementById('state_'+id);
+  if (j.status==='done'){ stEl.textContent='OK'; stEl.classList.add('ok'); stEl.classList.remove('bad'); localStorage.removeItem('job_server_'+id); }
+  else if (j.status==='failed'){ stEl.textContent='Fallo'; stEl.classList.add('bad'); stEl.classList.remove('ok'); localStorage.removeItem('job_server_'+id); }
+  else { stEl.textContent='En curso…'; stEl.classList.remove('ok','bad'); }
+  if(j.status==='running') setTimeout(()=>pollJob(id),700); else setTimeout(loadServers,800);
+}
+
+async function reattachActiveJobs(){
+  servers.forEach(s=>{
+    const saved = localStorage.getItem('job_server_'+s.id);
+    if (saved){ jobsByServer[s.id]=saved; document.getElementById('job_'+s.id).style.display=''; pollJob(s.id); }
+  });
+  const r=await fetch('/api/jobs/active'); const j=await r.json();
+  (j.active||[]).forEach(jb=>{
+    if (jb.type==='backup'){
+      jobsByServer[jb.server_id]=jb.id;
+      localStorage.setItem('job_server_'+jb.server_id, jb.id);
+      document.getElementById('job_'+jb.server_id).style.display='';
+      pollJob(jb.server_id);
+    } else if (jb.type==='restore'){
+      restoreJobId = jb.id;
+      localStorage.setItem('restore_job', jb.id);
+      document.getElementById('restore_job').style.display='';
+      pollRestore(jb.id);
+    }
+  });
+  const rj = localStorage.getItem('restore_job');
+  if (rj){ restoreJobId = rj; document.getElementById('restore_job').style.display=''; pollRestore(rj); }
+}
+
+async function loadBackups(server_id){
+  const box=document.getElementById('bk_'+server_id); box.style.display='';
+  box.innerHTML='<div class="small">Cargando...</div>';
+  const r=await fetch('/api/backups?server_id='+server_id); const j=await r.json();
+  if(!j.backups || !j.backups.length){ box.innerHTML='<div class="small">Sin backups aún.</div>'; return; }
+  let html='<table><thead><tr><th>ID</th><th>Archivo</th><th>Tamaño</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
+  html+=j.backups.map(b=>{
+    const sz=b.size_bytes!=null ? (b.size_bytes/1e9).toFixed(2)+' GB' : '-';
+    const st = b.status === 'done' ? '<span class="ok state">OK</span>' : (b.status === 'failed' ? '<span class="bad state">Fallo</span>' : b.status);
+    return \`<tr>
+      <td>\${b.id}</td><td>\${b.filename}</td><td>\${sz}</td><td>\${st}</td><td>\${new Date(b.created_at).toLocaleString()}</td>
+      <td>
+        <a class="link" href="/api/backups/download/\${b.id}">Descargar</a>
+        &nbsp;|&nbsp;<a class="link" href="#" onclick="delBackup(\${b.id}, \${server_id});return false;">Borrar</a>
+      </td>
+    </tr>\`;
+  }).join('');
+  html+='</tbody></table>';
+  box.innerHTML=html;
+}
+
+async function loadRestores(server_id){
+  const box=document.getElementById('rst_'+server_id); box.style.display='';
+  box.innerHTML='<div class="small">Cargando...</div>';
+  const r=await fetch('/api/restores?server_id='+server_id); const j=await r.json();
+  if(!j.restores || !j.restores.length){ box.innerHTML='<div class="small">Aún no hay restauraciones.</div>'; return; }
+  let html='<table><thead><tr><th>ID</th><th>Backup</th><th>Origen → Destino</th><th>Modo</th><th>SSH</th><th>Estado</th><th>Fecha</th></tr></thead><tbody>';
+  html+=j.restores.map(x=>{
+    const dest = x.mode==='same'
+      ? (x.target_label || x.source_label || 'Misma VPS')
+      : (x.target_label ? (x.target_label + (x.target_ip2? ' ('+x.target_ip2+')':'')) : (x.target_ip || '-'));
+    const origin = (x.source_label || '-') + (x.source_ip ? (' ('+x.source_ip+')') : '');
+    const ssh = x.preserve_auth ? '<span class="chip on">Preservado</span>' : '<span class="chip off">Sobrescrito</span>';
+    const st = x.status === 'done' ? '<span class="ok state">OK</span>' : (x.status === 'failed' ? '<span class="bad state">Fallo</span>' : x.status);
+    return \`<tr>
+      <td>\${x.id}</td>
+      <td>\${x.backup_id} — \${x.filename}</td>
+      <td>\${origin} → \${dest}</td>
+      <td>\${x.mode}</td>
+      <td>\${ssh}</td>
+      <td>\${st}</td>
+      <td>\${new Date(x.created_at).toLocaleString()}</td>
+    </tr>\`;
+  }).join('');
+  html+='</tbody></table>';
+  box.innerHTML=html;
+}
+
+async function delBackup(id, server_id){
+  if(!confirm('¿Borrar este backup?')) return;
+  const r=await fetch('/api/backups/'+id,{method:'DELETE'}); if(r.ok) loadBackups(server_id);
+}
+
+function fillRestoreServers(){
+  const sel=document.getElementById('restore_server');
+  sel.innerHTML=servers.map(s=>\`<option value="\${s.id}">\${s.label||'(sin etiqueta)'} — \${s.ip}</option>\`).join('');
+  if(servers.length) loadRestoreBackups();
+}
+async function loadRestoreBackups(){
+  const sid=document.getElementById('restore_server').value;
+  const r=await fetch('/api/backups?server_id='+sid); const j=await r.json();
+  const sel=document.getElementById('restore_backup');
+  sel.innerHTML=(j.backups||[]).map(b=>\`<option value="\${b.id}">\${b.id} — \${b.filename}</option>\`).join('');
+}
+
+function toggleRestoreMode(){
+  const mode=document.getElementById('restore_mode').value;
+  document.querySelectorAll('.restore-other').forEach(e=> e.style.display=(mode==='other')?'':'none');
+}
+
+async function restore(){
+  const backup_id=document.getElementById('restore_backup').value;
+  const mode=document.getElementById('restore_mode').value;
+  const body={ backup_id, mode }; // preserve_auth = true por backend; red no preservada por default
+  if(mode==='other'){
+    body.ip=document.getElementById('dst_ip').value;
+    body.ssh_user=document.getElementById('dst_user').value || 'root';
+    body.ssh_pass=document.getElementById('dst_pass').value;
+  }
+  const r=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json(); if(!r.ok){ alert(j.error||'Error'); return; }
+  restoreJobId = j.job_id;
+  localStorage.setItem('restore_job', j.job_id);
+  document.getElementById('restore_job').style.display='';
+  pollRestore(j.job_id);
+}
+async function pollRestore(jobId){
+  const r=await fetch('/api/job/'+jobId); if(!r.ok) return;
+  const j=await r.json();
+  document.getElementById('restore_bar').style.width=(j.percent||0)+'%';
+  document.getElementById('restore_log').innerHTML=(j.logs||[]).map(l=>l.replace(/</g,'&lt;')).join('<br>');
+  const stEl=document.getElementById('restore_state');
+  if (j.status==='done'){ stEl.textContent='OK'; stEl.classList.add('ok'); stEl.classList.remove('bad'); localStorage.removeItem('restore_job'); }
+  else if (j.status==='failed'){ stEl.textContent='Fallo'; stEl.classList.add('bad'); stEl.classList.remove('ok'); localStorage.removeItem('restore_job'); }
+  else { stEl.textContent='En curso…'; stEl.classList.remove('ok','bad'); }
+  if(j.status==='running') setTimeout(()=>pollRestore(jobId),700);
+}
+
+document.addEventListener('change', (e)=>{ if(e.target && e.target.id==='restore_server') loadRestoreBackups(); });
+loadServers();
+</script>
+</body>
+</html>`;
+}
+
+module.exports = { createPanelRouter };
