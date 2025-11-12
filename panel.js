@@ -592,7 +592,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     if (!updates.length) return res.status(400).json({ error: "Nada para actualizar" });
 
     db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
-    const updated = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run FROM servers WHERE id = ?`).get(id);
+    const updated = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run FROM servers WHERE id = ?").get(id);
     res.json({ server: updated });
   });
 
@@ -1115,14 +1115,14 @@ async function delRestore(id, server_id){
 
 function fillRestoreServers(){
   const sel=document.getElementById('restore_server');
-  sel.innerHTML=servers.map(s=>\`<option value="\${s.id}">\${s.label||'(sin etiqueta)'} — \${s.ip}</option>\`).join('');
+  sel.innerHTML=servers.map(s=>`<option value="${s.id}">${s.label||'(sin etiqueta)'} — ${s.ip}</option>`).join('');
   if(servers.length) loadRestoreBackups();
 }
 async function loadRestoreBackups(){
   const sid=document.getElementById('restore_server').value;
   const r=await fetch('/api/backups?server_id='+sid); const j=await r.json();
   const sel=document.getElementById('restore_backup');
-  sel.innerHTML=(j.backups||[]).map(b=>\`<option value="\${b.id}">\${b.id} — \${b.filename}</option>\`).join('');
+  sel.innerHTML=(j.backups||[]).map(b=>`<option value="${b.id}">${b.id} — ${b.filename}</option>`).join('');
 }
 
 function toggleRestoreMode(){
