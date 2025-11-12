@@ -29,20 +29,20 @@ db.exec(`
   PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS servers (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    label        TEXT,
-    ip           TEXT NOT NULL,
-    ssh_user     TEXT NOT NULL DEFAULT 'root',
-    ssh_pass     TEXT NOT NULL,
-    schedule_key TEXT NOT NULL DEFAULT 'off',
-    interval_ms  INTEGER NOT NULL DEFAULT 0,
-    enabled      INTEGER NOT NULL DEFAULT 0,
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    label         TEXT,
+    ip            TEXT NOT NULL,
+    ssh_user      TEXT NOT NULL DEFAULT 'root',
+    ssh_pass      TEXT NOT NULL,
+    schedule_key  TEXT NOT NULL DEFAULT 'off',
+    interval_ms   INTEGER NOT NULL DEFAULT 0,
+    enabled       INTEGER NOT NULL DEFAULT 0,
     retention_key TEXT NOT NULL DEFAULT 'off',
     retention_ms  INTEGER NOT NULL DEFAULT 0,
-    last_run     TEXT,
-    next_run     TEXT,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    last_run      TEXT,
+    next_run      TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
   CREATE TRIGGER IF NOT EXISTS trg_servers_updated_at
@@ -173,6 +173,22 @@ function parseScpPercent(line) {
   return m ? Math.min(100, Math.max(0, parseInt(m[1], 10))) : null;
 }
 
+// Limpieza de huella SSH (known_hosts) para evitar “REMOTE HOST IDENTIFICATION HAS CHANGED!”
+async function sshPrepareHost(ip) {
+  if (!ip || isLocalIP(ip)) return;
+  const safeIp = String(ip).trim();
+  const cmd = `
+    set -e
+    mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    if command -v ssh-keygen >/dev/null 2>&1; then
+      ssh-keygen -R ${safeIp} >/dev/null 2>&1 || true
+      ssh-keygen -R [${safeIp}]:22 >/dev/null 2>&1 || true
+    fi
+    sed -i "/${safeIp.replace(/\./g, "\\.")}[[:space:]]/d" ~/.ssh/known_hosts 2>/dev/null || true
+  `;
+  await run("bash", ["-lc", cmd]);
+}
+
 // ===== Exclusiones =====
 // Auth/SSH (preservar)
 const EXCLUDE_AUTH = [
@@ -185,7 +201,7 @@ const EXCLUDE_NET = [
   "etc/netplan/*","etc/network/*","etc/resolv.conf",
   "etc/hostname","etc/hosts","etc/machine-id","etc/fstab"
 ];
-// Pseudo-FS y cosas efímeras/RO (no tienen sentido en backup)
+// Pseudo-FS y efímeros/RO (no útiles en backup)
 const EXCLUDE_ALWAYS = [
   "proc/*","sys/*","dev/*","run/*","tmp/*","mnt/*","media/*","lost+found","snap/*"
 ];
@@ -208,7 +224,7 @@ function buildRsyncExcludeFlags(preserveAuth, preserveNet){
   if (preserveNet)  arr = arr.concat(EXCLUDE_NET);
   return arr.map(p=>`--exclude='${p}'`).join(" ");
 }
-// panel.js — Parte 2/4 (backup + restore + scheduler + retention)
+// panel.js — Parte 2/4 (retention + backup + restore + scheduler)
 
 // ===== Limpieza por retención =====
 function cleanupBackupsForServer(serverRow, job = null) {
@@ -276,6 +292,7 @@ async function doBackup(serverRow, job, backupRecordId) {
       logJob(job, `Archivo local creado: ${localFile}`);
       job.percent = 85;
     } else {
+      await sshPrepareHost(ip);
       const tarRemoteCmd = `
         if command -v pigz >/dev/null 2>&1; then
           nice -n ${NICE} ionice -c ${IONICE_CLASS} \
@@ -296,6 +313,7 @@ async function doBackup(serverRow, job, backupRecordId) {
       logJob(job, `Archivo remoto creado: ${remoteTmp}`);
       job.percent = 35;
 
+      await sshPrepareHost(ip);
       const scpArgs = ["sshpass","-e","scp","-o","StrictHostKeyChecking=no"];
       if (SCP_LIMIT_KBPS > 0) scpArgs.push("-l", String(SCP_LIMIT_KBPS));
       scpArgs.push(`${ssh_user}@${ip}:${remoteTmp}`, localFile);
@@ -307,6 +325,7 @@ async function doBackup(serverRow, job, backupRecordId) {
       logJob(job, `Descargado a: ${localFile}`);
       job.percent = Math.max(job.percent, 85);
 
+      await sshPrepareHost(ip);
       await run("env", ["sshpass","-e","ssh","-o","StrictHostKeyChecking=no", `${ssh_user}@${ip}`, `rm -f ${remoteTmp}`],
         { env: { ...process.env, SSHPASS: ssh_pass }});
       logJob(job, `Limpieza remota ok`);
@@ -395,6 +414,7 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
   const remoteTmp = `/tmp/restore-${Date.now()}.tgz`;
 
   try {
+    await sshPrepareHost(targetIP);
     const scpUp = ["sshpass","-e","scp","-o","StrictHostKeyChecking=no"];
     if (SCP_LIMIT_KBPS > 0) scpUp.push("-l", String(SCP_LIMIT_KBPS));
     scpUp.push(localFile, `${targetUser}@${targetIP}:${remoteTmp}`);
@@ -410,6 +430,7 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
   }
 
   try {
+    await sshPrepareHost(targetIP);
     const remoteScript = cleanMode ? `
       set -e
       TMPD=$(mktemp -d /tmp/rest.$RANDOM.XXXX)
@@ -475,7 +496,6 @@ function startTimer(serverRow) {
   db.prepare("UPDATE servers SET next_run = ? WHERE id = ?").run(next, serverRow.id);
 }
 (function bootTimers(){ db.prepare("SELECT * FROM servers").all().forEach(startTimer); })();
-
 // panel.js — Parte 3/4 (API REST)
 
 function createPanelRouter({ ensureAuth } = {}) {
@@ -518,6 +538,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     }});
   });
 
+  // Actualizar configuración general (programa, retención, enabled, label)
   router.put("/api/servers/:id", (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
@@ -554,6 +575,25 @@ function createPanelRouter({ ensureAuth } = {}) {
       retention_key: updated.retention_key, retention_ms: updated.retention_ms,
       last_run: updated.last_run, next_run: updated.next_run
     }});
+  });
+
+  // NUEVO: actualizar sólo credenciales SSH (usuario/contraseña)
+  router.put("/api/servers/:id/creds", (req, res) => {
+    const id = +req.params.id;
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+
+    const { ssh_user, ssh_pass } = req.body || {};
+    const updates = [], params = [];
+
+    if (typeof ssh_user === "string" && ssh_user.trim()) { updates.push("ssh_user = ?"); params.push(ssh_user.trim()); }
+    if (typeof ssh_pass === "string" && ssh_pass.length)   { updates.push("ssh_pass = ?"); params.push(ssh_pass); }
+
+    if (!updates.length) return res.status(400).json({ error: "Nada para actualizar" });
+
+    db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
+    const updated = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run FROM servers WHERE id = ?`).get(id);
+    res.json({ server: updated });
   });
 
   router.delete("/api/servers/:id", (req, res) => {
@@ -737,7 +777,7 @@ function renderPanelPage() {
 <body>
 <header>
   <img src="https://cdn.russellxz.click/3c8ab72a.png" alt="logo">
-  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">Preserva SSH y RED por defecto · Limpieza activa + Retención</div></div>
+  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">Preserva SSH y RED por defecto · Limpieza activa + Retención · Huella SSH auto-limpieza</div></div>
   <div style="flex:1"></div>
   <form method="post" action="/logout"><button class="secondary">Salir</button></form>
   <a href="/usuarios"><button class="secondary">Usuarios</button></a>
@@ -822,7 +862,6 @@ let restoreJobId = null;
 
 function fmt(dt){ if(!dt) return "-"; return new Date(dt).toLocaleString(); }
 function left(ms){ if(ms<=0) return "00:00:00"; const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,"0"); const m=String(Math.floor((s%3600)/60)).padStart(2,"0"); const ss=String(s%60).padStart(2,"0"); return \`\${h}:\${m}:\${ss}\`; }
-
 function humanRetention(k){
   const map = {
     off:"No borrar",
@@ -883,6 +922,7 @@ function renderServers(){
           <button onclick="toggleServer(\${s.id}, \${!s.enabled})">\${s.enabled?'Desactivar':'Activar'}</button>
           <button onclick="manual(\${s.id})">Backup ahora</button>
           <button class="secondary" onclick="cleanup(\${s.id})">Limpiar ahora</button>
+          <button class="secondary" onclick="editCreds(\${s.id})">Credenciales</button>
           <a class="link" href="#" onclick="loadBackups(\${s.id});return false;">Ver backups</a>
           &nbsp;|&nbsp;
           <a class="link" href="#" onclick="loadRestores(\${s.id});return false;">Ver restauraciones</a>
@@ -960,6 +1000,22 @@ async function cleanup(id){
   alert('Limpieza realizada: '+(j.deleted||0)+' backup(s) eliminados.');
   loadServers();
 }
+async function editCreds(id){
+  const s = servers.find(x=>x.id===id);
+  const user = prompt('Nuevo usuario SSH (dejar vacío para mantener):', s?.ssh_user || 'root');
+  if (user === null) return;
+  const pass = prompt('Nueva contraseña SSH (dejar vacío para mantener la actual):', '');
+  const body = {};
+  if (user && user !== s?.ssh_user) body.ssh_user = user.trim();
+  if (pass !== null && pass !== '') body.ssh_pass = pass;
+  if (!Object.keys(body).length) { alert('Sin cambios'); return; }
+  const r = await fetch('/api/servers/'+id+'/creds',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j = await r.json();
+  if(!r.ok){ alert(j.error||'Error'); return; }
+  alert('Credenciales actualizadas.');
+  loadServers();
+}
+
 async function pollJob(id){
   const jobId=jobsByServer[id] || localStorage.getItem('job_server_'+id);
   if(!jobId) return;
