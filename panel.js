@@ -1,4 +1,4 @@
-// panel.js (REEMPLAZO COMPLETO) — Parte 1/4
+// panel.js — REEMPLAZO COMPLETO
 "use strict";
 
 const fs = require("fs");
@@ -85,7 +85,7 @@ db.exec(`
   END;
 `);
 
-// Migraciones suaves (try/catch)
+// Migraciones suaves
 try { db.prepare("ALTER TABLE restores ADD COLUMN target_server_id INTEGER").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN preserve_auth INTEGER NOT NULL DEFAULT 1").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN note TEXT").run(); } catch {}
@@ -106,7 +106,7 @@ const SCHEDULES = {
   "1m":  30 * 24 * 60 * 60 * 1000,
 };
 
-// Retenciones fijas por tiempo + dinámicas en base al schedule
+// Retenciones
 const RETENTION_KEYS = {
   off: 0,
   "1d":  1  * 24 * 60 * 60 * 1000,
@@ -117,7 +117,6 @@ const RETENTION_KEYS = {
   "60d": 60 * 24 * 60 * 60 * 1000,
   "90d": 90 * 24 * 60 * 60 * 1000,
   "180d":180* 24 * 60 * 60 * 1000,
-  // dinámicas: schedxN => N * interval_ms
   "schedx3": -3,
   "schedx7": -7,
 };
@@ -173,7 +172,7 @@ function parseScpPercent(line) {
   return m ? Math.min(100, Math.max(0, parseInt(m[1], 10))) : null;
 }
 
-// Limpieza de huella SSH (known_hosts) para evitar “REMOTE HOST IDENTIFICATION HAS CHANGED!”
+// Limpieza de huella SSH (known_hosts)
 async function sshPrepareHost(ip) {
   if (!ip || isLocalIP(ip)) return;
   const safeIp = String(ip).trim();
@@ -190,18 +189,15 @@ async function sshPrepareHost(ip) {
 }
 
 // ===== Exclusiones =====
-// Auth/SSH (preservar)
 const EXCLUDE_AUTH = [
   "etc/shadow","etc/shadow-","etc/gshadow","etc/gshadow-",
   "etc/passwd","etc/passwd-","etc/group","etc/group-",
   "etc/ssh/*","root/.ssh/*","home/*/.ssh/*"
 ];
-// Red (preservar)
 const EXCLUDE_NET = [
   "etc/netplan/*","etc/network/*","etc/resolv.conf",
   "etc/hostname","etc/hosts","etc/machine-id","etc/fstab"
 ];
-// Pseudo-FS y efímeros/RO (no útiles en backup)
 const EXCLUDE_ALWAYS = [
   "proc/*","sys/*","dev/*","run/*","tmp/*","mnt/*","media/*","lost+found","snap/*"
 ];
@@ -224,7 +220,6 @@ function buildRsyncExcludeFlags(preserveAuth, preserveNet){
   if (preserveNet)  arr = arr.concat(EXCLUDE_NET);
   return arr.map(p=>`--exclude='${p}'`).join(" ");
 }
-// panel.js — Parte 2/4 (retention + backup + restore + scheduler)
 
 // ===== Limpieza por retención =====
 function cleanupBackupsForServer(serverRow, job = null) {
@@ -250,7 +245,7 @@ function cleanupBackupsForServer(serverRow, job = null) {
   return { deleted };
 }
 
-// barrido global periódico
+// Barrido global periódico
 setInterval(() => {
   const servers = db.prepare("SELECT * FROM servers ORDER BY id ASC").all();
   for (const s of servers) cleanupBackupsForServer(s);
@@ -339,7 +334,6 @@ async function doBackup(serverRow, job, backupRecordId) {
   db.prepare(`UPDATE backups SET size_bytes = ?, status = 'done' WHERE id = ?`).run(size, backupRecordId);
   db.prepare(`UPDATE servers SET last_run = datetime('now') WHERE id = ?`).run(server_id);
 
-  // retención post-backup
   try {
     const rowNow = db.prepare("SELECT * FROM servers WHERE id = ?").get(server_id);
     const { deleted } = cleanupBackupsForServer(rowNow, job);
@@ -352,7 +346,7 @@ async function doBackup(serverRow, job, backupRecordId) {
   logJob(job, `Backup finalizado (${(size/1e9).toFixed(2)} GB)`);
 }
 
-// ===== Restore (limpio, preservando SSH/RED) =====
+// ===== Restore =====
 async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PRESERVE_AUTH_DEFAULT, preserveNet = PRESERVE_NET_DEFAULT, cleanMode = CLEAN_RESTORE_DEFAULT }, job) {
   const srv = db.prepare("SELECT * FROM servers WHERE id = ?").get(backupRow.server_id);
   if (!srv) throw new Error("Servidor de origen no encontrado");
@@ -376,7 +370,6 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
   logJob(job, `Restaurando en ${targetIP} (${isLocalIP(targetIP) ? "local" : "remoto"})…`);
   job.percent = 5;
 
-  // Local
   if (isLocalIP(targetIP)) {
     try {
       if (cleanMode) {
@@ -410,7 +403,6 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
     return;
   }
 
-  // Remoto
   const remoteTmp = `/tmp/restore-${Date.now()}.tgz`;
 
   try {
@@ -484,7 +476,6 @@ function startTimer(serverRow) {
       finishJob(job, false, `Error: ${e.message}`);
       db.prepare(`UPDATE backups SET status = 'failed' WHERE server_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1`).run(row.id);
     } finally {
-      // retención periódica extra (por si no hubo backup)
       try { cleanupBackupsForServer(row, null); } catch {}
       const next2 = computeNextRun(intervalMs);
       db.prepare("UPDATE servers SET next_run = ?, last_run = COALESCE(last_run, datetime('now')) WHERE id = ?").run(next2, row.id);
@@ -496,8 +487,8 @@ function startTimer(serverRow) {
   db.prepare("UPDATE servers SET next_run = ? WHERE id = ?").run(next, serverRow.id);
 }
 (function bootTimers(){ db.prepare("SELECT * FROM servers").all().forEach(startTimer); })();
-// panel.js — Parte 3/4 (API REST)
 
+// ===== API + UI =====
 function createPanelRouter({ ensureAuth } = {}) {
   const router = express.Router();
   router.use((req, res, next) => ensureAuth ? ensureAuth(req, res, next) : next());
@@ -538,7 +529,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     }});
   });
 
-  // Actualizar configuración general (programa, retención, enabled, label)
+  // Actualizar configuración (programa, retención, enabled, label)
   router.put("/api/servers/:id", (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
@@ -577,7 +568,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     }});
   });
 
-  // NUEVO: actualizar sólo credenciales SSH (usuario/contraseña)
+  // Actualizar sólo credenciales SSH
   router.put("/api/servers/:id/creds", (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
@@ -734,7 +725,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ restores: rows });
   });
 
-  // Borrar registro de restauración (éxito o fallo)
+  // Borrar registro de restauración
   router.delete("/api/restores/:id", (req, res) => {
     const id = +req.params.id;
     const r = db.prepare("SELECT * FROM restores WHERE id = ?").get(id);
@@ -745,8 +736,8 @@ function createPanelRouter({ ensureAuth } = {}) {
 
   return router;
 }
-// panel.js — Parte 4/4 (UI)
 
+// ===== UI (sin backticks dentro del <script>) =====
 function renderPanelPage() {
   return `<!DOCTYPE html>
 <html lang="es">
@@ -861,7 +852,7 @@ let jobsByServer = {};
 let restoreJobId = null;
 
 function fmt(dt){ if(!dt) return "-"; return new Date(dt).toLocaleString(); }
-function left(ms){ if(ms<=0) return "00:00:00"; const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,"0"); const m=String(Math.floor((s%3600)/60)).padStart(2,"0"); const ss=String(s%60).padStart(2,"0"); return \`\${h}:\${m}:\${ss}\`; }
+function left(ms){ if(ms<=0) return "00:00:00"; const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,"0"); const m=String(Math.floor((s%3600)/60)).padStart(2,"0"); const ss=String(s%60).padStart(2,"0"); return h + ":" + m + ":" + ss; }
 function humanRetention(k){
   const map = {
     off:"No borrar",
@@ -883,62 +874,69 @@ function renderServers(){
   const wrap=document.getElementById('servers-wrap');
   if(!servers.length){ wrap.innerHTML='<div class="small">No hay servidores configurados.</div>'; return; }
   wrap.innerHTML='';
-  servers.forEach(s=>{
+  servers.forEach(function(s){
     const row=document.createElement('div'); row.className='row';
-    row.innerHTML=\`
-      <div class="grid cols-2" style="align-items:end">
-        <div class="row">
-          <div><strong>\${s.label || '(sin etiqueta)'} — \${s.ip}</strong></div>
-          <div class="small">Usuario: \${s.ssh_user}</div>
-          <div class="small">Último: \${fmt(s.last_run)} | Próximo: <span data-next="\${s.next_run || ''}" class="countdown"></span></div>
-          <div class="small">Programa: \${s.schedule_key} — Estado: <span class="chip \${s.enabled?'on':'off'}">\${s.enabled?'ON':'OFF'}</span></div>
-          <div class="small">Retención: <strong>\${humanRetention(s.retention_key)}</strong></div>
-        </div>
-        <div class="flex right">
-          <select id="sch_\${s.id}">
-            <option value="off" \${s.schedule_key==='off'?'selected':''}>Apagado</option>
-            <option value="1h" \${s.schedule_key==='1h'?'selected':''}>Cada 1 hora</option>
-            <option value="6h" \${s.schedule_key==='6h'?'selected':''}>Cada 6 horas</option>
-            <option value="12h" \${s.schedule_key==='12h'?'selected':''}>Cada 12 horas</option>
-            <option value="1d" \${s.schedule_key==='1d'?'selected':''}>Cada día</option>
-            <option value="1w" \${s.schedule_key==='1w'?'selected':''}>Cada semana</option>
-            <option value="15d" \${s.schedule_key==='15d'?'selected':''}>Cada 15 días</option>
-            <option value="1m" \${s.schedule_key==='1m'?'selected':''}>Cada mes</option>
-          </select>
-          <select id="ret_\${s.id}">
-            <option value="off"  \${s.retention_key==='off'?'selected':''}>No borrar</option>
-            <option value="1d"   \${s.retention_key==='1d'?'selected':''}>≥ 1 día</option>
-            <option value="3d"   \${s.retention_key==='3d'?'selected':''}>≥ 3 días</option>
-            <option value="7d"   \${s.retention_key==='7d'?'selected':''}>≥ 7 días</option>
-            <option value="15d"  \${s.retention_key==='15d'?'selected':''}>≥ 15 días</option>
-            <option value="30d"  \${s.retention_key==='30d'?'selected':''}>≥ 30 días</option>
-            <option value="60d"  \${s.retention_key==='60d'?'selected':''}>≥ 60 días</option>
-            <option value="90d"  \${s.retention_key==='90d'?'selected':''}>≥ 90 días</option>
-            <option value="180d" \${s.retention_key==='180d'?'selected':''}>≥ 180 días</option>
-            <option value="schedx3" \${s.retention_key==='schedx3'?'selected':''}>≥ 3× programa</option>
-            <option value="schedx7" \${s.retention_key==='schedx7'?'selected':''}>≥ 7× programa</option>
-          </select>
-          <button onclick="saveSched(\${s.id})">Guardar</button>
-          <button onclick="toggleServer(\${s.id}, \${!s.enabled})">\${s.enabled?'Desactivar':'Activar'}</button>
-          <button onclick="manual(\${s.id})">Backup ahora</button>
-          <button class="secondary" onclick="cleanup(\${s.id})">Limpiar ahora</button>
-          <button class="secondary" onclick="editCreds(\${s.id})">Credenciales</button>
-          <a class="link" href="#" onclick="loadBackups(\${s.id});return false;">Ver backups</a>
-          &nbsp;|&nbsp;
-          <a class="link" href="#" onclick="loadRestores(\${s.id});return false;">Ver restauraciones</a>
-          &nbsp;|&nbsp;
-          <button class="secondary" onclick="delServer(\${s.id})" style="background:#b91c1c">Eliminar VPS</button>
-        </div>
-      </div>
-      <div id="bk_\${s.id}" class="row" style="display:none"></div>
-      <div id="rst_\${s.id}" class="row" style="display:none"></div>
-      <div id="job_\${s.id}" class="row" style="display:none">
-        <div style="display:flex;gap:10px;align-items:center">
-          <div class="bar" style="flex:1"><span id="bar_\${s.id}" style="width:0%"></span></div>
-          <div id="state_\${s.id}" class="state small"></div>
-        </div>
-        <div id="log_\${s.id}" class="small"></div>
-      </div>\`;
+
+    var html = '';
+    html += '<div class="grid cols-2" style="align-items:end">';
+    html +=   '<div class="row">';
+    html +=     '<div><strong>' + (s.label || '(sin etiqueta)') + ' — ' + s.ip + '</strong></div>';
+    html +=     '<div class="small">Usuario: ' + s.ssh_user + '</div>';
+    html +=     '<div class="small">Último: ' + fmt(s.last_run) + ' | Próximo: <span data-next="' + (s.next_run || '') + '" class="countdown"></span></div>';
+    html +=     '<div class="small">Programa: ' + s.schedule_key + ' — Estado: <span class="chip ' + (s.enabled?'on':'off') + '">' + (s.enabled?'ON':'OFF') + '</span></div>';
+    html +=     '<div class="small">Retención: <strong>' + humanRetention(s.retention_key) + '</strong></div>';
+    html +=   '</div>';
+    html +=   '<div class="flex right">';
+
+    html +=     '<select id="sch_' + s.id + '">';
+    html +=       '<option value="off"' + (s.schedule_key==='off'?' selected':'') + '>Apagado</option>';
+    html +=       '<option value="1h"' + (s.schedule_key==='1h'?' selected':'') + '>Cada 1 hora</option>';
+    html +=       '<option value="6h"' + (s.schedule_key==='6h'?' selected':'') + '>Cada 6 horas</option>';
+    html +=       '<option value="12h"' + (s.schedule_key==='12h'?' selected':'') + '>Cada 12 horas</option>';
+    html +=       '<option value="1d"' + (s.schedule_key==='1d'?' selected':'') + '>Cada día</option>';
+    html +=       '<option value="1w"' + (s.schedule_key==='1w'?' selected':'') + '>Cada semana</option>';
+    html +=       '<option value="15d"' + (s.schedule_key==='15d'?' selected':'') + '>Cada 15 días</option>';
+    html +=       '<option value="1m"' + (s.schedule_key==='1m'?' selected':'') + '>Cada mes</option>';
+    html +=     '</select>';
+
+    html +=     '<select id="ret_' + s.id + '">';
+    html +=       '<option value="off"'  + (s.retention_key==='off'?' selected':'')  + '>No borrar</option>';
+    html +=       '<option value="1d"'   + (s.retention_key==='1d'?' selected':'')   + '>&ge; 1 día</option>';
+    html +=       '<option value="3d"'   + (s.retention_key==='3d'?' selected':'')   + '>&ge; 3 días</option>';
+    html +=       '<option value="7d"'   + (s.retention_key==='7d'?' selected':'')   + '>&ge; 7 días</option>';
+    html +=       '<option value="15d"'  + (s.retention_key==='15d'?' selected':'')  + '>&ge; 15 días</option>';
+    html +=       '<option value="30d"'  + (s.retention_key==='30d'?' selected':'')  + '>&ge; 30 días</option>';
+    html +=       '<option value="60d"'  + (s.retention_key==='60d'?' selected':'')  + '>&ge; 60 días</option>';
+    html +=       '<option value="90d"'  + (s.retention_key==='90d'?' selected':'')  + '>&ge; 90 días</option>';
+    html +=       '<option value="180d"' + (s.retention_key==='180d'?' selected':'') + '>&ge; 180 días</option>';
+    html +=       '<option value="schedx3"' + (s.retention_key==='schedx3'?' selected':'') + '>&ge; 3× programa</option>';
+    html +=       '<option value="schedx7"' + (s.retention_key==='schedx7'?' selected':'') + '>&ge; 7× programa</option>';
+    html +=     '</select>';
+
+    html +=     '<button onclick="saveSched(' + s.id + ')">Guardar</button>';
+    html +=     '<button onclick="toggleServer(' + s.id + ', ' + (!s.enabled) + ')">' + (s.enabled?'Desactivar':'Activar') + '</button>';
+    html +=     '<button onclick="manual(' + s.id + ')">Backup ahora</button>';
+    html +=     '<button class="secondary" onclick="cleanup(' + s.id + ')">Limpiar ahora</button>';
+    html +=     '<button class="secondary" onclick="editCreds(' + s.id + ')">Credenciales</button>';
+    html +=     '<a class="link" href="#" onclick="loadBackups(' + s.id + ');return false;">Ver backups</a>';
+    html +=     '&nbsp;|&nbsp;';
+    html +=     '<a class="link" href="#" onclick="loadRestores(' + s.id + ');return false;">Ver restauraciones</a>';
+    html +=     '&nbsp;|&nbsp;';
+    html +=     '<button class="secondary" onclick="delServer(' + s.id + ')" style="background:#b91c1c">Eliminar VPS</button>';
+    html +=   '</div>';
+    html += '</div>';
+
+    html += '<div id="bk_' + s.id + '" class="row" style="display:none"></div>';
+    html += '<div id="rst_' + s.id + '" class="row" style="display:none"></div>';
+    html += '<div id="job_' + s.id + '" class="row" style="display:none">';
+    html +=   '<div style="display:flex;gap:10px;align-items:center">';
+    html +=     '<div class="bar" style="flex:1"><span id="bar_' + s.id + '" style="width:0%"></span></div>';
+    html +=     '<div id="state_' + s.id + '" class="state small"></div>';
+    html +=   '</div>';
+    html +=   '<div id="log_' + s.id + '" class="small"></div>';
+    html += '</div>';
+
+    row.innerHTML = html;
     wrap.appendChild(row);
   });
   tickCountdowns();
@@ -946,7 +944,7 @@ function renderServers(){
 
 function tickCountdowns(){
   const els=document.querySelectorAll('.countdown');
-  els.forEach(el=>{ const nx=el.getAttribute('data-next'); if(!nx){ el.textContent='-'; return; } const ms=new Date(nx)-new Date(); el.textContent=left(ms); });
+  els.forEach(function(el){ const nx=el.getAttribute('data-next'); if(!nx){ el.textContent='-'; return; } const ms=new Date(nx)-new Date(); el.textContent=left(ms); });
   setTimeout(tickCountdowns,1000);
 }
 
@@ -971,7 +969,7 @@ async function saveSched(id){
   if(r.ok) loadServers();
 }
 async function toggleServer(id, enabled){
-  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled})});
+  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});
   if(r.ok) loadServers();
 }
 async function delServer(id){
@@ -984,7 +982,9 @@ async function delServer(id){
 
 async function manual(id){
   const r=await fetch('/api/servers/'+id+'/backup-now',{method:'POST'});
-  const j=await r.json(); if(!r.ok){ alert(j.error||'Error'); 
+  const j=await r.json(); 
+  if(!r.ok){ 
+    alert(j.error||'Error'); 
     if (j.job_id){ localStorage.setItem('job_server_'+id, j.job_id); document.getElementById('job_'+id).style.display=''; pollJob(id); }
     return; 
   }
@@ -997,16 +997,16 @@ async function cleanup(id){
   const r=await fetch('/api/servers/'+id+'/cleanup',{method:'POST'});
   const j=await r.json();
   if(!r.ok){ alert(j.error||'Error'); return; }
-  alert('Limpieza realizada: '+(j.deleted||0)+' backup(s) eliminados.');
+  alert('Limpieza realizada: ' + (j.deleted||0) + ' backup(s) eliminados.');
   loadServers();
 }
 async function editCreds(id){
-  const s = servers.find(x=>x.id===id);
-  const user = prompt('Nuevo usuario SSH (dejar vacío para mantener):', s?.ssh_user || 'root');
+  const s = servers.find(function(x){ return x.id===id; });
+  const user = prompt('Nuevo usuario SSH (dejar vacío para mantener):', (s && s.ssh_user) || 'root');
   if (user === null) return;
   const pass = prompt('Nueva contraseña SSH (dejar vacío para mantener la actual):', '');
   const body = {};
-  if (user && user !== s?.ssh_user) body.ssh_user = user.trim();
+  if (user && (!s || user !== s.ssh_user)) body.ssh_user = user.trim();
   if (pass !== null && pass !== '') body.ssh_pass = pass;
   if (!Object.keys(body).length) { alert('Sin cambios'); return; }
   const r = await fetch('/api/servers/'+id+'/creds',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -1023,22 +1023,22 @@ async function pollJob(id){
   if(!r.ok){ return; }
   const j=await r.json();
   document.getElementById('bar_'+id).style.width=(j.percent||0)+'%';
-  document.getElementById('log_'+id).innerHTML=(j.logs||[]).map(l=>l.replace(/</g,'&lt;')).join('<br>');
+  document.getElementById('log_'+id).innerHTML=(j.logs||[]).map(function(l){return l.replace(/</g,'&lt;');}).join('<br>');
   document.getElementById('job_'+id).style.display='';
   const stEl=document.getElementById('state_'+id);
   if (j.status==='done'){ stEl.textContent='OK'; stEl.classList.add('ok'); stEl.classList.remove('bad'); localStorage.removeItem('job_server_'+id); }
   else if (j.status==='failed'){ stEl.textContent='Fallo'; stEl.classList.add('bad'); stEl.classList.remove('ok'); localStorage.removeItem('job_server_'+id); }
   else { stEl.textContent='En curso…'; stEl.classList.remove('ok','bad'); }
-  if(j.status==='running') setTimeout(()=>pollJob(id),700); else setTimeout(loadServers,800);
+  if(j.status==='running') setTimeout(function(){ pollJob(id); },700); else setTimeout(loadServers,800);
 }
 
 async function reattachActiveJobs(){
-  servers.forEach(s=>{
+  servers.forEach(function(s){
     const saved = localStorage.getItem('job_server_'+s.id);
     if (saved){ jobsByServer[s.id]=saved; document.getElementById('job_'+s.id).style.display=''; pollJob(s.id); }
   });
   const r=await fetch('/api/jobs/active'); const j=await r.json();
-  (j.active||[]).forEach(jb=>{
+  (j.active||[]).forEach(function(jb){
     if (jb.type==='backup'){
       jobsByServer[jb.server_id]=jb.id;
       localStorage.setItem('job_server_'+jb.server_id, jb.id);
@@ -1060,17 +1060,21 @@ async function loadBackups(server_id){
   box.innerHTML='<div class="small">Cargando...</div>';
   const r=await fetch('/api/backups?server_id='+server_id); const j=await r.json();
   if(!j.backups || !j.backups.length){ box.innerHTML='<div class="small">Sin backups aún.</div>'; return; }
-  let html='<table><thead><tr><th>ID</th><th>Archivo</th><th>Tamaño</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
-  html+=j.backups.map(b=>{
+  var html='<table><thead><tr><th>ID</th><th>Archivo</th><th>Tamaño</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
+  html += j.backups.map(function(b){
     const sz=b.size_bytes!=null ? (b.size_bytes/1e9).toFixed(2)+' GB' : '-';
     const st = b.status === 'done' ? '<span class="ok state">OK</span>' : (b.status === 'failed' ? '<span class="bad state">Fallo</span>' : b.status);
-    return \`<tr>
-      <td>\${b.id}</td><td>\${b.filename}</td><td>\${sz}</td><td>\${st}</td><td>\${new Date(b.created_at).toLocaleString()}</td>
-      <td>
-        <a class="link" href="/api/backups/download/\${b.id}">Descargar</a>
-        &nbsp;|&nbsp;<a class="link" href="#" onclick="delBackup(\${b.id}, \${server_id});return false;">Borrar</a>
-      </td>
-    </tr>\`;
+    return '<tr>'
+      + '<td>' + b.id + '</td>'
+      + '<td>' + b.filename + '</td>'
+      + '<td>' + sz + '</td>'
+      + '<td>' + st + '</td>'
+      + '<td>' + new Date(b.created_at).toLocaleString() + '</td>'
+      + '<td>'
+      +   '<a class="link" href="/api/backups/download/' + b.id + '">Descargar</a>'
+      +   '&nbsp;|&nbsp;<a class="link" href="#" onclick="delBackup(' + b.id + ', ' + server_id + ');return false;">Borrar</a>'
+      + '</td>'
+      + '</tr>';
   }).join('');
   html+='</tbody></table>';
   box.innerHTML=html;
@@ -1081,24 +1085,24 @@ async function loadRestores(server_id){
   box.innerHTML='<div class="small">Cargando...</div>';
   const r=await fetch('/api/restores?server_id='+server_id); const j=await r.json();
   if(!j.restores || !j.restores.length){ box.innerHTML='<div class="small">Aún no hay restauraciones.</div>'; return; }
-  let html='<table><thead><tr><th>ID</th><th>Backup</th><th>Origen → Destino</th><th>Modo</th><th>SSH</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
-  html+=j.restores.map(x=>{
+  var html='<table><thead><tr><th>ID</th><th>Backup</th><th>Origen → Destino</th><th>Modo</th><th>SSH</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
+  html += j.restores.map(function(x){
     const dest = x.mode==='same'
-      ? (x.target_label || x.source_label || 'Misma VPS')
+      ? ((x.target_label || x.source_label || 'Misma VPS'))
       : (x.target_label ? (x.target_label + (x.target_ip2? ' ('+x.target_ip2+')':'')) : (x.target_ip || '-'));
     const origin = (x.source_label || '-') + (x.source_ip ? (' ('+x.source_ip+')') : '');
     const ssh = x.preserve_auth ? '<span class="chip on">Preservado</span>' : '<span class="chip off">Sobrescrito</span>';
     const st = x.status === 'done' ? '<span class="ok state">OK</span>' : (x.status === 'failed' ? '<span class="bad state">Fallo</span>' : x.status);
-    return \`<tr>
-      <td>\${x.id}</td>
-      <td>\${x.backup_id} — \${x.filename}</td>
-      <td>\${origin} → \${dest}</td>
-      <td>\${x.mode}</td>
-      <td>\${ssh}</td>
-      <td>\${st}</td>
-      <td>\${new Date(x.created_at).toLocaleString()}</td>
-      <td><a class="link" href="#" onclick="delRestore(\${x.id}, \${server_id});return false;">Borrar registro</a></td>
-    </tr>\`;
+    return '<tr>'
+      + '<td>' + x.id + '</td>'
+      + '<td>' + x.backup_id + ' — ' + x.filename + '</td>'
+      + '<td>' + origin + ' → ' + dest + '</td>'
+      + '<td>' + x.mode + '</td>'
+      + '<td>' + ssh + '</td>'
+      + '<td>' + st + '</td>'
+      + '<td>' + new Date(x.created_at).toLocaleString() + '</td>'
+      + '<td><a class="link" href="#" onclick="delRestore(' + x.id + ', ' + server_id + ');return false;">Borrar registro</a></td>'
+      + '</tr>';
   }).join('');
   html+='</tbody></table>';
   box.innerHTML=html;
@@ -1115,25 +1119,30 @@ async function delRestore(id, server_id){
 
 function fillRestoreServers(){
   const sel=document.getElementById('restore_server');
-  sel.innerHTML=servers.map(s=>`<option value="${s.id}">${s.label||'(sin etiqueta)'} — ${s.ip}</option>`).join('');
+  sel.innerHTML=(servers||[]).map(function(s){
+    const label = s.label || '(sin etiqueta)';
+    return '<option value="' + s.id + '">' + label + ' — ' + s.ip + '</option>';
+  }).join('');
   if(servers.length) loadRestoreBackups();
 }
 async function loadRestoreBackups(){
   const sid=document.getElementById('restore_server').value;
   const r=await fetch('/api/backups?server_id='+sid); const j=await r.json();
   const sel=document.getElementById('restore_backup');
-  sel.innerHTML=(j.backups||[]).map(b=>`<option value="${b.id}">${b.id} — ${b.filename}</option>`).join('');
+  sel.innerHTML=(j.backups||[]).map(function(b){
+    return '<option value="' + b.id + '">' + b.id + ' — ' + b.filename + '</option>';
+  }).join('');
 }
 
 function toggleRestoreMode(){
   const mode=document.getElementById('restore_mode').value;
-  document.querySelectorAll('.restore-other').forEach(e=> e.style.display=(mode==='other')?'':'none');
+  document.querySelectorAll('.restore-other').forEach(function(e){ e.style.display=(mode==='other')?'':'none'; });
 }
 
 async function restore(){
   const backup_id=document.getElementById('restore_backup').value;
   const mode=document.getElementById('restore_mode').value;
-  const body={ backup_id, mode }; // preserve_auth y preserve_net por defecto se aplican en backend
+  const body={ backup_id: backup_id, mode: mode };
   if(mode==='other'){
     body.ip=document.getElementById('dst_ip').value;
     body.ssh_user=document.getElementById('dst_user').value || 'root';
@@ -1150,15 +1159,15 @@ async function pollRestore(jobId){
   const r=await fetch('/api/job/'+jobId); if(!r.ok) return;
   const j=await r.json();
   document.getElementById('restore_bar').style.width=(j.percent||0)+'%';
-  document.getElementById('restore_log').innerHTML=(j.logs||[]).map(l=>l.replace(/</g,'&lt;')).join('<br>');
+  document.getElementById('restore_log').innerHTML=(j.logs||[]).map(function(l){return l.replace(/</g,'&lt;');}).join('<br>');
   const stEl=document.getElementById('restore_state');
   if (j.status==='done'){ stEl.textContent='OK'; stEl.classList.add('ok'); stEl.classList.remove('bad'); localStorage.removeItem('restore_job'); }
   else if (j.status==='failed'){ stEl.textContent='Fallo'; stEl.classList.add('bad'); stEl.classList.remove('ok'); localStorage.removeItem('restore_job'); }
   else { stEl.textContent='En curso…'; stEl.classList.remove('ok','bad'); }
-  if(j.status==='running') setTimeout(()=>pollRestore(jobId),700);
+  if(j.status==='running') setTimeout(function(){ pollRestore(jobId); },700);
 }
 
-document.addEventListener('change', (e)=>{ if(e.target && e.target.id==='restore_server') loadRestoreBackups(); });
+document.addEventListener('change', function(e){ if(e.target && e.target.id==='restore_server') loadRestoreBackups(); });
 loadServers();
 </script>
 </body>
