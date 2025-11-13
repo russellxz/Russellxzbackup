@@ -4,20 +4,18 @@
 const express = require("express");
 const os = require("os");
 const { execFile } = require("child_process");
-const {
-  listUsers,
-  createUser,
-  updateUser,
-  deleteUser,
-} = require("./db");
+const { listUsers, createUser, updateUser, deleteUser } = require("./db");
 
 function createUsersRouter({ ensureAuth } = {}) {
   const router = express.Router();
-  router.use((req, res, next) => (ensureAuth ? ensureAuth(req, res, next) : next()));
+  if (ensureAuth) router.use(ensureAuth);
   router.use(express.json());
 
-  // ====== CONSOLA (SSE) ======
-  function snapshotCpuTimes() {
+  // ====== Métricas
+  const KB = 1024, MB = KB * 1024, GB = MB * 1024, TB = GB * 1024;
+  const fmtB = (b) => (b>=TB? (b/TB).toFixed(2)+" TB" : b>=GB? (b/GB).toFixed(2)+" GB" : b>=MB? (b/MB).toFixed(2)+" MB" : b>=KB? (b/KB).toFixed(2)+" KB" : b+" B");
+
+  const snapshotCpu = () => {
     const cpus = os.cpus() || [];
     let idle = 0, total = 0;
     for (const c of cpus) {
@@ -26,71 +24,46 @@ function createUsersRouter({ ensureAuth } = {}) {
       total += t.user + t.nice + t.sys + t.irq + t.idle;
     }
     return { idle, total, cores: cpus.length };
-  }
-  function cpuUsagePercent(prev, next) {
-    const idle = next.idle - prev.idle;
-    const total = next.total - prev.total;
+  };
+  const cpuPct = (a, b) => {
+    const idle = b.idle - a.idle;
+    const total = b.total - a.total;
     if (total <= 0) return 0;
     return ((total - idle) / total) * 100;
-  }
-  function formatBytes(bytes) {
-    const KB = 1024, MB = KB * 1024, GB = MB * 1024, TB = GB * 1024;
-    if (bytes >= TB) return (bytes / TB).toFixed(2) + " TB";
-    if (bytes >= GB) return (bytes / GB).toFixed(2) + " GB";
-    if (bytes >= MB) return (bytes / MB).toFixed(2) + " MB";
-    if (bytes >= KB) return (bytes / KB).toFixed(2) + " KB";
-    return bytes + " B";
-  }
-  function getDiskStats(path = "/") {
-    return new Promise((resolve, reject) => {
-      execFile("df", ["-kP", path], { timeout: 3000 }, (err, stdout) => {
+  };
+
+  const getDisk = (p = "/") =>
+    new Promise((resolve, reject) => {
+      execFile("df", ["-kP", p], { timeout: 3000 }, (err, out) => {
         if (err) return reject(err);
-        const lines = String(stdout || "").trim().split("\n");
-        if (lines.length < 2) return reject(new Error("df output inesperado"));
+        const lines = String(out || "").trim().split("\n");
+        if (lines.length < 2) return reject(new Error("df vacío"));
         const parts = lines[1].trim().split(/\s+/);
-        if (parts.length < 6) return reject(new Error("df parse error"));
         const blocksK = parseInt(parts[1], 10) || 0;
-        const usedK   = parseInt(parts[2], 10) || 0;
-        const availK  = parseInt(parts[3], 10) || 0;
-        const capText = parts[4]; // "12%"
-        const mount   = parts[5];
-        const totalBytes = blocksK * 1024;
-        const usedBytes  = usedK   * 1024;
-        const availBytes = availK  * 1024;
+        const usedK = parseInt(parts[2], 10) || 0;
+        const availK = parseInt(parts[3], 10) || 0;
+        const capText = parts[4];
+        const mount = parts[5];
+        const total = blocksK * 1024;
+        const used = usedK * 1024;
+        const avail = availK * 1024;
         let usedPct = Number(String(capText).replace("%", ""));
-        if (!Number.isFinite(usedPct) || usedPct < 0) {
-          usedPct = totalBytes > 0 ? (usedBytes / totalBytes) * 100 : 0;
-        }
+        if (!Number.isFinite(usedPct)) usedPct = total ? (used / total) * 100 : 0;
         resolve({
           filesystem: parts[0],
           mount,
-          totalBytes,
-          usedBytes,
-          availBytes,
+          totalBytes: total,
+          usedBytes: used,
+          availBytes: avail,
           usedPct,
           freePct: 100 - usedPct,
-          totalHuman: formatBytes(totalBytes),
-          availHuman: formatBytes(availBytes),
+          totalHuman: fmtB(total),
+          availHuman: fmtB(avail),
         });
       });
     });
-  }
-  // RAM del sistema
-  function getMemStats() {
-    const total = os.totalmem();
-    const free  = os.freemem();
-    const used  = Math.max(0, total - free);
-    const usedPct = total > 0 ? (used / total) * 100 : 0;
-    return {
-      totalBytes: total,
-      freeBytes: free,
-      usedBytes: used,
-      usedPct,
-      totalHuman: formatBytes(total),
-      freeHuman: formatBytes(free),
-    };
-  }
 
+  // ====== SSE
   router.get("/api/monitor/events", async (req, res) => {
     const path = (typeof req.query.path === "string" && req.query.path.trim()) ? req.query.path.trim() : "/";
     const intervalMs = Math.max(300, parseInt(req.query.ms || "1000", 10));
@@ -102,46 +75,55 @@ function createUsersRouter({ ensureAuth } = {}) {
       "X-Accel-Buffering": "no",
     });
 
-    let prev = snapshotCpuTimes();
+    let prev = snapshotCpu();
 
     const tick = async () => {
       try {
-        const next = snapshotCpuTimes();
-        const cpuPct = Math.max(0, Math.min(100, cpuUsagePercent(prev, next) || 0));
+        const next = snapshotCpu();
+        const cpu = Math.max(0, Math.min(100, cpuPct(prev, next) || 0));
         prev = next;
-        const [disk, mem] = await Promise.all([
-          getDiskStats(path).catch(() => null),
-          Promise.resolve(getMemStats()),
-        ]);
-        const payload = {
-          now: new Date().toLocaleString(),
-          cpuPct,
-          cores: next.cores,
-          loadAvg: (os.loadavg() || []).map((n) => (n || 0).toFixed(2)),
-          disk,
-          mem,
-        };
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      } catch (_) {
-        // ignorar y seguir intentando
+
+        // RAM
+        const total = os.totalmem();
+        const free = os.freemem();
+        const used = total - free;
+        const ramPct = total ? (used / total) * 100 : 0;
+
+        const disk = await getDisk(path).catch(() => null);
+
+        res.write(
+          `data:${JSON.stringify({
+            now: new Date().toISOString(),
+            cpuPct: cpu,
+            cores: next.cores,
+            loadAvg: (os.loadavg() || []).map((n) => (n || 0).toFixed(2)),
+            ram: {
+              totalBytes: total,
+              usedBytes: used,
+              freeBytes: free,
+              usedPct: ramPct,
+              totalHuman: fmtB(total),
+              usedHuman: fmtB(used),
+              freeHuman: fmtB(free),
+            },
+            disk,
+          })}\n\n`
+        );
+      } catch {
+        /* ignore */
       }
     };
 
-    // primer envío inmediato
     tick();
     const it = setInterval(tick, intervalMs);
     req.on("close", () => clearInterval(it));
   });
 
-  // ====== PÁGINAS ======
-  router.get("/usuarios", (req, res) => {
-    res.type("html").send(renderUsersPage());
-  });
+  // ====== UI
+  router.get("/usuarios", (_req, res) => res.type("html").send(renderPage()));
 
-  // ====== API Usuarios ======
-  router.get("/api/users", (req, res) => {
-    res.json({ users: listUsers() });
-  });
+  // ====== API Users
+  router.get("/api/users", (req, res) => res.json({ users: listUsers() }));
 
   router.post("/api/users", (req, res) => {
     const { email = "", password = "", active = true } = req.body || {};
@@ -182,7 +164,7 @@ function createUsersRouter({ ensureAuth } = {}) {
   return router;
 }
 
-function renderUsersPage() {
+function renderPage() {
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -190,41 +172,20 @@ function renderUsersPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Usuarios — SkyUltraPlus</title>
 <style>
-  :root{
-    --bg:#ffffff;--fg:#0f172a;--muted:#64748b;--ring:#e5e7eb;--primary:#111827;--accent:#2563eb;--danger:#ef4444;--ok:#16a34a
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  :root{--bg:#ffffff;--fg:#0f172a;--muted:#64748b;--ring:#e5e7eb;--primary:#111827;--accent:#2563eb}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
   header{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--ring)}
   header img{width:40px;height:40px}
-  h1{font-size:18px;margin:0}
-  .sub{font-size:12px;color:var(--muted)}
+  h1{font-size:18px;margin:0}.sub{font-size:12px;color:var(--muted)}
   main{max-width:1000px;margin:0 auto;padding:20px;display:grid;gap:18px}
   .card{border:1px solid var(--ring);border-radius:12px;padding:16px}
-  .row{display:grid;gap:10px}
-  .grid{display:grid;gap:12px}
-  .grid.cols-2{grid-template-columns:1fr 1fr}
-  label{font-size:12px;color:var(--muted)}
-  input,select{width:100%;padding:10px 12px;border:1px solid var(--ring);border-radius:10px;font-size:14px}
+  .row{display:grid;gap:10px}.grid{display:grid;gap:12px}.grid.cols-2{grid-template-columns:1fr 1fr}
+  label{font-size:12px;color:var(--muted)} input,select{width:100%;padding:10px 12px;border:1px solid var(--ring);border-radius:10px;font-size:14px}
   button{padding:10px 12px;border:none;border-radius:10px;background:var(--primary);color:#fff;font-weight:600;cursor:pointer}
-  button.secondary{background:#334155}
-  button.link{background:transparent;color:var(--accent);padding:0}
-  table{width:100%;border-collapse:collapse}
-  th,td{padding:10px;border-bottom:1px solid var(--ring);text-align:left;font-size:14px}
-  .small{font-size:12px;color:var(--muted)}
-  .ok{color:#065f46}
-  .warn{color:#991b1b}
-  .badge{display:inline-block;padding:4px 8px;border-radius:999px;border:1px solid var(--ring);font-size:12px}
-  .on{background:#ecfdf5;border-color:#a7f3d0;color:#065f46}
-  .off{background:#fef2f2;border-color:#fecaca;color:#991b1b}
-  .actions{display:flex;gap:8px;flex-wrap:wrap}
-
-  /* Consola */
-  .metric{display:flex;align-items:center;gap:12px}
-  .bar{flex:1;height:10px;background:#f1f5f9;border-radius:999px;overflow:hidden;border:1px solid var(--ring)}
+  button.secondary{background:#334155} table{width:100%;border-collapse:collapse} th,td{padding:10px;border-bottom:1px solid var(--ring);text-align:left;font-size:14px}
+  .metric{display:flex;align-items:center;gap:12px}.bar{flex:1;height:10px;background:#f1f5f9;border-radius:999px;overflow:hidden;border:1px solid var(--ring)}
   .bar>span{display:block;height:100%;background:linear-gradient(90deg,#60a5fa,#2563eb)}
-  .kpi{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--ring);color:var(--muted)}
+  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--ring);color:#334155}
 </style>
 </head>
 <body>
@@ -236,88 +197,58 @@ function renderUsersPage() {
   </div>
   <div style="flex:1"></div>
   <a href="/panel"><button class="secondary">Volver al Panel</button></a>
-  <form method="post" action="/logout"><button class="secondary">Salir</button></form>
+  <form method="post" action="/logout" style="margin-left:8px"><button class="secondary">Salir</button></form>
 </header>
 
 <main>
-  <!-- Consola embebida -->
+  <!-- Consola -->
   <section class="card">
-    <h2 style="margin:0 0 10px;font-size:16px">Consola — CPU, RAM y Disco (tiempo real)</h2>
+    <h2 style="margin:0 0 10px;font-size:16px">Consola — CPU / RAM / Disco</h2>
     <div class="grid cols-2">
       <div class="row">
         <label>Ruta de disco a monitorear</label>
         <input id="diskPath" value="/" placeholder="/"/>
       </div>
-      <div class="row" style="align-self:end">
-        <button id="btnApply">Aplicar</button>
-      </div>
+      <div class="row" style="align-self:end"><button id="btnApply">Aplicar</button></div>
     </div>
-    <div class="small" style="margin-top:6px">Tip: usa <code>/</code> para el disco raíz, o un punto de montaje (p. ej. <code>/mnt/data</code>).</div>
-
     <div class="row" style="margin-top:12px">
       <div class="metric">
-        <div style="width:110px">CPU total</div>
+        <div style="width:110px">CPU</div>
         <div class="bar"><span id="cpuBar" style="width:0%"></span></div>
         <div id="cpuPct" style="width:70px;text-align:right">0%</div>
       </div>
-      <div class="kpi">
-        <div><span class="pill" id="cores">Cores: -</span></div>
-        <div><span class="pill" id="load">Load avg: -</span></div>
-      </div>
+      <div><span class="pill" id="cores">Cores: -</span> <span class="pill" id="load">Load: -</span></div>
     </div>
-
-    <div class="row" style="margin-top:12px">
+    <div class="row" style="margin-top:8px">
       <div class="metric">
-        <div style="width:110px">RAM usada</div>
+        <div style="width:110px">RAM</div>
         <div class="bar"><span id="ramBar" style="width:0%"></span></div>
-        <div id="ramUsed" style="width:70px;text-align:right">0%</div>
-      </div>
-      <div class="kpi">
-        <div><span class="pill" id="ramTotal">Total: -</span></div>
-        <div><span class="pill" id="ramFree">Libre: -</span></div>
+        <div id="ramUsed" style="width:170px;text-align:right">0%</div>
       </div>
     </div>
-
-    <div class="row" style="margin-top:12px">
+    <div class="row" style="margin-top:8px">
       <div class="metric">
-        <div style="width:110px">Disco usado</div>
+        <div style="width:110px">Disco</div>
         <div class="bar"><span id="diskBar" style="width:0%"></span></div>
         <div id="diskUsed" style="width:70px;text-align:right">0%</div>
       </div>
-      <div class="kpi">
-        <div><span class="pill" id="diskTotal">Total: -</span></div>
-        <div><span class="pill" id="diskFree">Libre: -</span></div>
-      </div>
-      <div class="small" id="mountInfo">Montaje: —</div>
+      <div><span class="pill" id="diskTotal">Total: -</span> <span class="pill" id="diskFree">Libre: -</span> <span class="pill" id="mountInfo">—</span></div>
     </div>
   </section>
 
-  <!-- Gestión de usuarios -->
+  <!-- Crear usuario -->
   <section class="card">
     <h2 style="margin:0 0 10px;font-size:16px">Crear usuario</h2>
     <div class="grid cols-2">
-      <div class="row">
-        <label>Correo</label>
-        <input id="new_email" type="email" placeholder="nuevo@correo.com"/>
-      </div>
-      <div class="row">
-        <label>Contraseña</label>
-        <input id="new_password" type="password" placeholder="••••••••"/>
-      </div>
-      <div class="row">
-        <label>Activo</label>
-        <select id="new_active">
-          <option value="true">Sí</option>
-          <option value="false">No</option>
-        </select>
-      </div>
-      <div class="row" style="align-self:end">
-        <button onclick="createUser()">Crear</button>
-      </div>
+      <div class="row"><label>Correo</label><input id="new_email" type="email" placeholder="nuevo@correo.com"/></div>
+      <div class="row"><label>Contraseña</label><input id="new_password" type="password" placeholder="••••••••"/></div>
+      <div class="row"><label>Activo</label><select id="new_active"><option value="true">Sí</option><option value="false">No</option></select></div>
+      <div class="row" style="align-self:end"><button onclick="createUser()">Crear</button></div>
     </div>
-    <div class="small">Todos los usuarios tienen permisos administrativos (para socios).</div>
+    <div class="sub">Todos los usuarios tienen permisos administrativos.</div>
   </section>
 
+  <!-- Lista -->
   <section class="card">
     <div style="display:flex;justify-content:space-between;align-items:center">
       <h2 style="margin:0 0 10px;font-size:16px">Lista de usuarios</h2>
@@ -328,7 +259,6 @@ function renderUsersPage() {
 </main>
 
 <script>
-/* ===== Consola (SSE) ===== */
 let es = null;
 function connectConsole(path){
   if (es) es.close();
@@ -339,21 +269,17 @@ function connectConsole(path){
     try {
       const j = JSON.parse(ev.data || "{}");
       // CPU
-      const pct = Math.max(0, Math.min(100, j.cpuPct || 0));
-      document.getElementById("cpuBar").style.width = pct.toFixed(1) + "%";
-      document.getElementById("cpuPct").textContent = pct.toFixed(1) + "%";
+      const c = Math.max(0, Math.min(100, j.cpuPct || 0));
+      document.getElementById("cpuBar").style.width = c.toFixed(1) + "%";
+      document.getElementById("cpuPct").textContent = c.toFixed(1) + "%";
       document.getElementById("cores").textContent = "Cores: " + (j.cores ?? "-");
-      document.getElementById("load").textContent  = "Load avg: " + (j.loadAvg || []).join(", ");
-
+      document.getElementById("load").textContent  = "Load: " + (j.loadAvg || []).join(", ");
       // RAM
-      if (j.mem) {
-        const rused = Math.max(0, Math.min(100, j.mem.usedPct || 0));
-        document.getElementById("ramBar").style.width = rused.toFixed(1) + "%";
-        document.getElementById("ramUsed").textContent = rused.toFixed(1) + "%";
-        document.getElementById("ramTotal").textContent = "Total: " + (j.mem.totalHuman || "-");
-        document.getElementById("ramFree").textContent  = "Libre: " + (j.mem.freeHuman || "-");
+      if (j.ram) {
+        const rp = Math.max(0, Math.min(100, j.ram.usedPct || 0));
+        document.getElementById("ramBar").style.width = rp.toFixed(1) + "%";
+        document.getElementById("ramUsed").textContent = rp.toFixed(1) + "% (" + j.ram.usedHuman + " / " + j.ram.totalHuman + ")";
       }
-
       // Disco
       if (j.disk) {
         const used = Math.max(0, Math.min(100, j.disk.usedPct || 0));
@@ -361,53 +287,46 @@ function connectConsole(path){
         document.getElementById("diskUsed").textContent = used.toFixed(1) + "%";
         document.getElementById("diskTotal").textContent = "Total: " + (j.disk.totalHuman || "-");
         document.getElementById("diskFree").textContent  = "Libre: " + (j.disk.availHuman || "-") + " (" + (j.disk.freePct||0).toFixed(1) + "%)";
-        document.getElementById("mountInfo").textContent = "Montaje: " + (j.disk.mount || "—") + " | Filesystem: " + (j.disk.filesystem || "—");
+        document.getElementById("mountInfo").textContent = "Montaje: " + (j.disk.mount || "—") + " | FS: " + (j.disk.filesystem || "—");
       }
     } catch {}
   };
-  es.onerror = ()=>{ /* SSE reintenta solo */ };
+  es.onerror = ()=>{};
 }
-document.getElementById("btnApply").addEventListener("click", (e)=>{
-  e.preventDefault();
-  const p = document.getElementById("diskPath").value || "/";
-  connectConsole(p);
+document.getElementById("btnApply").addEventListener("click", ()=>{
+  connectConsole(document.getElementById("diskPath").value || "/");
 });
 window.addEventListener("load", ()=>{
   connectConsole(document.getElementById("diskPath").value || "/");
 });
 
-/* ===== Users CRUD ===== */
 async function loadUsers(){
   const r = await fetch('/api/users'); const j = await r.json();
   const list = j.users || [];
   const wrap = document.getElementById('users_wrap');
-  if (!list.length){ wrap.innerHTML = '<div class="small">Sin usuarios.</div>'; return; }
+  if (!list.length){ wrap.innerHTML = '<div class="sub">Sin usuarios.</div>'; return; }
   let html = '<table><thead><tr><th>ID</th><th>Correo</th><th>Activo</th><th>Creado</th><th>Actualizado</th><th>Acciones</th></tr></thead><tbody>';
-  html += list.map(u=>{
-    return \`
-      <tr>
-        <td>\${u.id}</td>
-        <td><input id="email_\${u.id}" value="\${u.email}" style="width:100%"/></td>
-        <td>
-          <select id="active_\${u.id}">
-            <option value="true" \${u.is_active?'selected':''}>Sí</option>
-            <option value="false" \${!u.is_active?'selected':''}>No</option>
-          </select>
-        </td>
-        <td>\${new Date(u.created_at).toLocaleString()}</td>
-        <td>\${new Date(u.updated_at).toLocaleString()}</td>
-        <td class="actions">
-          <button onclick="save(\${u.id})">Guardar</button>
-          <button class="secondary" onclick="resetPass(\${u.id})">Cambiar clave</button>
-          <button style="background:#b91c1c" onclick="delUser(\${u.id})">Eliminar</button>
-        </td>
-      </tr>
-    \`;
-  }).join('');
+  html += list.map(u=>\`
+    <tr>
+      <td>\${u.id}</td>
+      <td><input id="email_\${u.id}" value="\${u.email}" style="width:100%"/></td>
+      <td>
+        <select id="active_\${u.id}">
+          <option value="true" \${u.is_active?'selected':''}>Sí</option>
+          <option value="false" \${!u.is_active?'selected':''}>No</option>
+        </select>
+      </td>
+      <td>\${new Date(u.created_at).toLocaleString()}</td>
+      <td>\${new Date(u.updated_at).toLocaleString()}</td>
+      <td>
+        <button onclick="save(\${u.id})">Guardar</button>
+        <button class="secondary" onclick="resetPass(\${u.id})">Cambiar clave</button>
+        <button style="background:#b91c1c" onclick="delUser(\${u.id})">Eliminar</button>
+      </td>
+    </tr>\`).join('');
   html += '</tbody></table>';
   wrap.innerHTML = html;
 }
-
 async function createUser(){
   const email = document.getElementById('new_email').value.trim();
   const password = document.getElementById('new_password').value;
@@ -416,39 +335,27 @@ async function createUser(){
   const r = await fetch('/api/users', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, password, active }) });
   const j = await r.json();
   if (!r.ok){ alert(j.error || 'Error al crear usuario'); return; }
-  document.getElementById('new_email').value='';
-  document.getElementById('new_password').value='';
-  document.getElementById('new_active').value='true';
+  document.getElementById('new_email').value=''; document.getElementById('new_password').value=''; document.getElementById('new_active').value='true';
   loadUsers();
 }
-
 async function save(id){
   const email = document.getElementById('email_'+id).value.trim();
   const active = document.getElementById('active_'+id).value === 'true';
   const r = await fetch('/api/users/'+id, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, active }) });
-  const j = await r.json();
-  if (!r.ok){ alert(j.error || 'Error al guardar'); return; }
-  loadUsers();
+  const j = await r.json(); if (!r.ok){ alert(j.error || 'Error al guardar'); return; } loadUsers();
 }
-
 async function resetPass(id){
-  const pw = prompt('Nueva contraseña:');
-  if (!pw) return;
+  const pw = prompt('Nueva contraseña:'); if (!pw) return;
   const r = await fetch('/api/users/'+id, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pw }) });
-  const j = await r.json();
-  if (!r.ok){ alert(j.error || 'Error al cambiar contraseña'); return; }
-  alert('Contraseña actualizada');
-  loadUsers();
+  const j = await r.json(); if (!r.ok){ alert(j.error || 'Error al cambiar contraseña'); return; }
+  alert('Contraseña actualizada'); loadUsers();
 }
-
 async function delUser(id){
   if (!confirm('¿Eliminar este usuario?')) return;
   const r = await fetch('/api/users/'+id, { method:'DELETE' });
-  const j = await r.json();
-  if (!r.ok){ alert(j.error || 'No se pudo eliminar (recuerda: no puedes borrar el único usuario restante)'); return; }
+  const j = await r.json(); if (!r.ok){ alert(j.error || 'No se pudo eliminar'); return; }
   loadUsers();
 }
-
 loadUsers();
 </script>
 </body>
