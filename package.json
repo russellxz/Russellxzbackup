@@ -1,7 +1,7 @@
 {
   "name": "skyultraplus-backup",
   "version": "1.0.0",
-  "description": "Sistema de backup/restauración de VPS (full filesystem) con panel, login y gestión de usuarios.",
+  "description": "Sistema de backup/restauración de VPS (full filesystem / Paymenter) con panel, login y gestión de usuarios.",
   "main": "index.js",
   "type": "commonjs",
   "private": true,
@@ -29,6 +29,7 @@
     "VPS",
     "ssh",
     "tar",
-    "sqlite"
+    "sqlite",
+    "paymenter"
   ]
 }
