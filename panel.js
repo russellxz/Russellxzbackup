@@ -1,4 +1,4 @@
-// panel.js — REEMPLAZO COMPLETO
+// panel.js — REEMPLAZO COMPLETO (Paymenter Focus)
 "use strict";
 
 const fs = require("fs");
@@ -16,33 +16,43 @@ const NICE = parseInt(process.env.BACKUP_NICE || "19", 10);
 const IONICE_CLASS = parseInt(process.env.BACKUP_IONICE_CLASS || "3", 10);
 const SCP_LIMIT_KBPS = parseInt(process.env.SCP_LIMIT_KBPS || "0", 10);
 
-// Por defecto: preservar SSH (credenciales) y RED del destino; restauración limpia activada
+// Defaults: preservar SSH/RED del destino; restauración "limpia" activada.
 const PRESERVE_AUTH_DEFAULT = (process.env.PRESERVE_AUTH || "1") === "1";
 const PRESERVE_NET_DEFAULT  = (process.env.PRESERVE_NET  || "1") === "1";
 const CLEAN_RESTORE_DEFAULT = (process.env.CLEAN_RESTORE || "1") === "1";
 
-// Barrido de retención periódico (aparte del post-backup)
+// Barrido de retención periódico
 const RETENTION_SWEEP_MS = parseInt(process.env.RETENTION_SWEEP_MS || String(6 * 60 * 60 * 1000), 10);
 
-// ===== DB =====
+// ===== DB (sqlite interna del panel) =====
 db.exec(`
   PRAGMA foreign_keys = ON;
 
   CREATE TABLE IF NOT EXISTS servers (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    label         TEXT,
-    ip            TEXT NOT NULL,
-    ssh_user      TEXT NOT NULL DEFAULT 'root',
-    ssh_pass      TEXT NOT NULL,
-    schedule_key  TEXT NOT NULL DEFAULT 'off',
-    interval_ms   INTEGER NOT NULL DEFAULT 0,
-    enabled       INTEGER NOT NULL DEFAULT 0,
-    retention_key TEXT NOT NULL DEFAULT 'off',
-    retention_ms  INTEGER NOT NULL DEFAULT 0,
-    last_run      TEXT,
-    next_run      TEXT,
-    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    label           TEXT,
+    ip              TEXT NOT NULL,
+    ssh_user        TEXT NOT NULL DEFAULT 'root',
+    ssh_pass        TEXT NOT NULL,
+
+    -- NUEVO: Paymenter path + credenciales DB
+    pmtr_path       TEXT NOT NULL DEFAULT '/var/www/paymenter',
+    db_host         TEXT NOT NULL DEFAULT '127.0.0.1',
+    db_name         TEXT NOT NULL DEFAULT 'paymenter',
+    db_user         TEXT NOT NULL DEFAULT 'paymenter',
+    db_pass         TEXT NOT NULL DEFAULT '',
+
+    schedule_key    TEXT NOT NULL DEFAULT 'off',
+    interval_ms     INTEGER NOT NULL DEFAULT 0,
+    enabled         INTEGER NOT NULL DEFAULT 0,
+
+    retention_key   TEXT NOT NULL DEFAULT 'off',
+    retention_ms    INTEGER NOT NULL DEFAULT 0,
+
+    last_run        TEXT,
+    next_run        TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
   CREATE TRIGGER IF NOT EXISTS trg_servers_updated_at
@@ -57,23 +67,24 @@ db.exec(`
     filename    TEXT NOT NULL,
     size_bytes  INTEGER,
     status      TEXT NOT NULL DEFAULT 'running',
+    type        TEXT NOT NULL DEFAULT 'full', -- 'db' | 'full'
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
   );
 
   CREATE TABLE IF NOT EXISTS restores (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    backup_id        INTEGER NOT NULL,
-    server_id_from   INTEGER NOT NULL,
-    mode             TEXT NOT NULL,  -- same|other
-    target_ip        TEXT,
-    target_user      TEXT,
-    target_server_id INTEGER,
-    preserve_auth    INTEGER NOT NULL DEFAULT 1,
-    note             TEXT,
-    status           TEXT NOT NULL DEFAULT 'running',
-    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    backup_id         INTEGER NOT NULL,
+    server_id_from    INTEGER NOT NULL,
+    mode              TEXT NOT NULL,  -- same|other
+    target_ip         TEXT,
+    target_user       TEXT,
+    target_server_id  INTEGER,
+    preserve_auth     INTEGER NOT NULL DEFAULT 1,
+    note              TEXT,
+    status            TEXT NOT NULL DEFAULT 'running',
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY(backup_id)      REFERENCES backups(id) ON DELETE CASCADE,
     FOREIGN KEY(server_id_from) REFERENCES servers(id) ON DELETE CASCADE
   );
@@ -85,18 +96,25 @@ db.exec(`
   END;
 `);
 
-// Migraciones suaves
+// Migraciones suaves (por si ya existe la tabla sin columnas nuevas)
+try { db.prepare("ALTER TABLE servers ADD COLUMN pmtr_path TEXT NOT NULL DEFAULT '/var/www/paymenter'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN db_host   TEXT NOT NULL DEFAULT '127.0.0.1'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN db_name   TEXT NOT NULL DEFAULT 'paymenter'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN db_user   TEXT NOT NULL DEFAULT 'paymenter'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN db_pass   TEXT NOT NULL DEFAULT ''").run(); } catch {}
+try { db.prepare("ALTER TABLE backups ADD COLUMN type TEXT NOT NULL DEFAULT 'full'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN retention_key TEXT NOT NULL DEFAULT 'off'").run(); } catch {}
+try { db.prepare("ALTER TABLE servers ADD COLUMN retention_ms  INTEGER NOT NULL DEFAULT 0").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN target_server_id INTEGER").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN preserve_auth INTEGER NOT NULL DEFAULT 1").run(); } catch {}
 try { db.prepare("ALTER TABLE restores ADD COLUMN note TEXT").run(); } catch {}
-try { db.prepare("ALTER TABLE servers ADD COLUMN retention_key TEXT NOT NULL DEFAULT 'off'").run(); } catch {}
-try { db.prepare("ALTER TABLE servers ADD COLUMN retention_ms INTEGER NOT NULL DEFAULT 0").run(); } catch {}
 
+// ===== Schedules / Retentions =====
 const timers = new Map(); // serverId -> setInterval
 const jobs = new Map();   // jobId -> {id,type,server_id,percent,status,logs,started_at,ended_at,extra}
 
 const SCHEDULES = {
-  off:   0,
+  off: 0,
   "1h":  1 * 60 * 60 * 1000,
   "6h":  6 * 60 * 60 * 1000,
   "12h": 12 * 60 * 60 * 1000,
@@ -106,17 +124,16 @@ const SCHEDULES = {
   "1m":  30 * 24 * 60 * 60 * 1000,
 };
 
-// Retenciones
 const RETENTION_KEYS = {
   off: 0,
-  "1d":  1  * 24 * 60 * 60 * 1000,
-  "3d":  3  * 24 * 60 * 60 * 1000,
-  "7d":  7  * 24 * 60 * 60 * 1000,
-  "15d": 15 * 24 * 60 * 60 * 1000,
-  "30d": 30 * 24 * 60 * 60 * 1000,
-  "60d": 60 * 24 * 60 * 60 * 1000,
-  "90d": 90 * 24 * 60 * 60 * 1000,
-  "180d":180* 24 * 60 * 60 * 1000,
+  "1d":   1  * 24 * 60 * 60 * 1000,
+  "3d":   3  * 24 * 60 * 60 * 1000,
+  "7d":   7  * 24 * 60 * 60 * 1000,
+  "15d":  15 * 24 * 60 * 60 * 1000,
+  "30d":  30 * 24 * 60 * 60 * 1000,
+  "60d":  60 * 24 * 60 * 60 * 1000,
+  "90d":  90 * 24 * 60 * 60 * 1000,
+  "180d": 180* 24 * 60 * 60 * 1000,
   "schedx3": -3,
   "schedx7": -7,
 };
@@ -164,7 +181,10 @@ function run(cmd, args, opts = {}) {
     let stdout = "", stderr = "";
     child.stdout.on("data", d => { const s = d.toString(); stdout += s; opts.onStdout && opts.onStdout(s); });
     child.stderr.on("data", d => { const s = d.toString(); stderr += s; opts.onStderr && opts.onStderr(s); });
-    child.on("close", code => (code === 0) ? resolve({ code, stdout, stderr }) : reject(Object.assign(new Error(`Command failed: ${cmd} ${args.join(" ")}`), { code, stdout, stderr })));
+    child.on("close", code => (code === 0)
+      ? resolve({ code, stdout, stderr })
+      : reject(Object.assign(new Error(`Command failed: ${cmd} ${args.join(" ")}`), { code, stdout, stderr }))
+    );
   });
 }
 function parseScpPercent(line) {
@@ -188,40 +208,11 @@ async function sshPrepareHost(ip) {
   await run("bash", ["-lc", cmd]);
 }
 
-// ===== Exclusiones =====
-const EXCLUDE_AUTH = [
-  "etc/shadow","etc/shadow-","etc/gshadow","etc/gshadow-",
-  "etc/passwd","etc/passwd-","etc/group","etc/group-",
-  "etc/ssh/*","root/.ssh/*","home/*/.ssh/*"
-];
-const EXCLUDE_NET = [
-  "etc/netplan/*","etc/network/*","etc/resolv.conf",
-  "etc/hostname","etc/hosts","etc/machine-id","etc/fstab"
-];
-const EXCLUDE_ALWAYS = [
-  "proc/*","sys/*","dev/*","run/*","tmp/*","mnt/*","media/*","lost+found","snap/*"
-];
-
-function buildExcludeFlags(relList){ return relList.map(p=>`--exclude='${p}'`).join(" "); }
+// ===== Exclusiones del backup de sistema (cuando se usa tar full root; ya no lo usamos para Paymenter-only) =====
+const EXCLUDE_ALWAYS = [ "proc/*","sys/*","dev/*","run/*","tmp/*","mnt/*","media/*","lost+found","snap/*" ];
 function buildExcludeFlagsAbs(relList){ return relList.map(p=>`--exclude='/${p}'`).join(" "); }
-function buildRestoreExcludeFlags(preserveAuth, preserveNet){
-  let arr = [...EXCLUDE_ALWAYS];
-  if (preserveAuth) arr = arr.concat(EXCLUDE_AUTH);
-  if (preserveNet)  arr = arr.concat(EXCLUDE_NET);
-  return arr.length ? buildExcludeFlags(arr) : "";
-}
-function buildBackupExcludeFlagsAbs(){
-  const arr = [...EXCLUDE_ALWAYS];
-  return arr.length ? buildExcludeFlagsAbs(arr) : "";
-}
-function buildRsyncExcludeFlags(preserveAuth, preserveNet){
-  let arr = [...EXCLUDE_ALWAYS];
-  if (preserveAuth) arr = arr.concat(EXCLUDE_AUTH);
-  if (preserveNet)  arr = arr.concat(EXCLUDE_NET);
-  return arr.map(p=>`--exclude='${p}'`).join(" ");
-}
 
-// ===== Limpieza por retención =====
+// ===== Retención =====
 function cleanupBackupsForServer(serverRow, job = null) {
   const { id: server_id, retention_key, interval_ms } = serverRow;
   const effMs = retentionMsFromKey(retention_key, interval_ms);
@@ -230,6 +221,7 @@ function cleanupBackupsForServer(serverRow, job = null) {
   const cutoff = Date.now() - effMs;
   const list = db.prepare("SELECT id, filename, created_at FROM backups WHERE server_id = ? AND status = 'done' ORDER BY id ASC").all(server_id);
   let deleted = 0;
+
   for (const b of list) {
     const created = Date.parse(b.created_at);
     if (!Number.isFinite(created)) continue;
@@ -244,66 +236,234 @@ function cleanupBackupsForServer(serverRow, job = null) {
   if (job && deleted === 0) logJob(job, `Retención: no había backups para eliminar.`);
   return { deleted };
 }
-
-// Barrido global periódico
+// Barrido global
 setInterval(() => {
   const servers = db.prepare("SELECT * FROM servers ORDER BY id ASC").all();
   for (const s of servers) cleanupBackupsForServer(s);
 }, RETENTION_SWEEP_MS);
 
-// ===== Backup =====
-async function doBackup(serverRow, job, backupRecordId) {
-  const { id: server_id, ip, ssh_user, ssh_pass } = serverRow;
+// ===== Scripts auxiliares (remotos) =====
+
+// Genera script remoto para crear dump lógico y empaquetar DB/.env (modo 'db').
+// Usa credenciales del panel si están, si no, extrae de .env.
+function buildRemoteDbOnlyBackupScript({ pmtr_path, db_host, db_name, db_user, db_pass }, outTar) {
+  return `
+    set -e
+    TMPD=$(mktemp -d /tmp/pmtrdb.$RANDOM.XXXX)
+    mkdir -p "$TMPD"
+    ENVF="${pmtr_path}/.env"
+
+    # Descubrir credenciales si faltan
+    DB_HOST="${db_host}"
+    DB_NAME="${db_name}"
+    DB_USER="${db_user}"
+    DB_PASS="${db_pass}"
+
+    if [ -z "$DB_PASS" ] && [ -f "$ENVF" ]; then
+      DB_HOST=$(grep -E '^DB_HOST=' "$ENVF" | head -n1 | cut -d= -f2- || echo "127.0.0.1")
+      DB_NAME=$(grep -E '^DB_DATABASE=' "$ENVF" | head -n1 | cut -d= -f2- || echo "paymenter")
+      DB_USER=$(grep -E '^DB_USERNAME=' "$ENVF" | head -n1 | cut -d= -f2- || echo "paymenter")
+      DB_PASS=$(grep -E '^DB_PASSWORD=' "$ENVF" | head -n1 | cut -d= -f2- || echo "")
+    fi
+
+    echo "[DB-Only] Dump → $DB_NAME@$DB_HOST (user=$DB_USER)"
+    if command -v mysqldump >/dev/null 2>&1; then
+      mysqldump --single-transaction --quick --routines --triggers --events -h"$DB_HOST" -u"$DB_USER" ${DB_PASS:+-p"$DB_PASS"} "$DB_NAME" | gzip -1 > "$TMPD/pmtr-db.sql.gz"
+    else
+      echo "mysqldump no encontrado"; exit 1
+    fi
+
+    # Incluir .env
+    if [ -f "$ENVF" ]; then cp -f "$ENVF" "$TMPD/.env"; fi
+
+    # Empaquetar
+    tar -C "$TMPD" -czpf ${outTar} pmtr-db.sql.gz .env || tar -C "$TMPD" -czpf ${outTar} pmtr-db.sql.gz || true
+    rm -rf "$TMPD"
+  `;
+}
+
+// Script para backup full: dump lógico y empaquetar carpeta Paymenter completa (incluye .env/archivos)
+function buildRemoteFullBackupScript({ pmtr_path, db_host, db_name, db_user, db_pass }, outTar) {
+  return `
+    set -e
+    ENVF="${pmtr_path}/.env"
+    DB_HOST="${db_host}"
+    DB_NAME="${db_name}"
+    DB_USER="${db_user}"
+    DB_PASS="${db_pass}"
+
+    if [ -z "$DB_PASS" ] && [ -f "$ENVF" ]; then
+      DB_HOST=$(grep -E '^DB_HOST=' "$ENVF" | head -n1 | cut -d= -f2- || echo "127.0.0.1")
+      DB_NAME=$(grep -E '^DB_DATABASE=' "$ENVF" | head -n1 | cut -d= -f2- || echo "paymenter")
+      DB_USER=$(grep -E '^DB_USERNAME=' "$ENVF" | head -n1 | cut -d= -f2- || echo "paymenter")
+      DB_PASS=$(grep -E '^DB_PASSWORD=' "$ENVF" | head -n1 | cut -d= -f2- || echo "")
+    fi
+
+    echo "[FULL] Dump → $DB_NAME@$DB_HOST (user=$DB_USER)"
+    if command -v mysqldump >/dev/null 2>&1; then
+      mkdir -p "${pmtr_path}/.sup-dumps"
+      mysqldump --single-transaction --quick --routines --triggers --events -h"$DB_HOST" -u"$DB_USER" ${DB_PASS:+-p"$DB_PASS"} "$DB_NAME" | gzip -1 > "${pmtr_path}/.sup-dumps/sup-db.sql.gz"
+    else
+      echo "mysqldump no encontrado"; exit 1
+    fi
+
+    PARENT="$(dirname "${pmtr_path}")"
+    BASEN="$(basename "${pmtr_path}")"
+
+    if command -v pigz >/dev/null 2>&1; then
+      nice -n ${NICE} ionice -c ${IONICE_CLASS} tar -C "$PARENT" -cpf - "$BASEN" | pigz -1 > ${outTar}
+    else
+      nice -n ${NICE} ionice -c ${IONICE_CLASS} tar -C "$PARENT" -czpf ${outTar} "$BASEN"
+    fi
+  `;
+}
+
+// Script para instalar dependencias de Paymenter en una VPS "vacía"
+function buildDepsScript() {
+  return `
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Paquetes base
+    sudo apt -y update
+    sudo apt -y install software-properties-common curl apt-transport-https ca-certificates gnupg tar unzip git
+
+    # PHP 8.3
+    if ! php -v 2>/dev/null | grep -q "PHP 8.3"; then
+      sudo add-apt-repository -y ppa:ondrej/php || true
+      sudo apt update -y
+      sudo apt -y install php8.3 php8.3-common php8.3-cli php8.3-gd php8.3-mysql php8.3-mbstring php8.3-bcmath php8.3-xml php8.3-fpm php8.3-curl php8.3-zip php8.3-intl php8.3-redis
+    fi
+
+    # MariaDB 10.11
+    if ! mysql --version 2>/dev/null | grep -q "MariaDB"; then
+      curl -sSL https://downloads.mariadb.com/MariaDB/mariadb_repo_setup | sudo bash -s -- --mariadb-server-version="mariadb-10.11" || true
+      sudo apt update -y
+      sudo apt -y install mariadb-server
+    fi
+
+    # Nginx + Redis
+    sudo apt -y install nginx redis-server || true
+
+    # Node.js + npm (para temas Paymenter)
+    if ! command -v node >/dev/null 2>&1; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+      sudo apt -y install nodejs
+    fi
+    if ! command -v npm >/dev/null 2>&1; then
+      sudo apt -y install npm || true
+    fi
+
+    # Habilitar servicios
+    sudo systemctl enable mariadb || true
+    sudo systemctl enable nginx || true
+    sudo systemctl enable php8.3-fpm || true
+    sudo systemctl enable redis-server || true
+
+    sudo systemctl start mariadb || true
+    sudo systemctl start nginx || true
+    sudo systemctl start php8.3-fpm || true
+    sudo systemctl start redis-server || true
+  `;
+}
+
+// Crea DB/usuario si no existen e importa dump, y coloca .env
+function buildDbImportScript(pmtr_path) {
+  return `
+    set -e
+    ENVF="${pmtr_path}/.env"
+    SRC_ENV="/tmp/pmtr-restore/.env"
+    SRC_DUMP="/tmp/pmtr-restore/pmtr-db.sql.gz"
+    mkdir -p "${pmtr_path}"
+
+    # Restaurar .env (reemplazo con backup de seguridad)
+    if [ -f "$SRC_ENV" ]; then
+      if [ -f "$ENVF" ]; then mv -f "$ENVF" "${pmtr_path}/.env.bak.$(date +%s)"; fi
+      cp -f "$SRC_ENV" "$ENVF"
+    fi
+
+    if [ ! -f "$ENVF" ]; then
+      echo ".env no encontrado; no puedo continuar."
+      exit 1
+    fi
+
+    DB_HOST=$(grep -E '^DB_HOST=' "$ENVF" | head -n1 | cut -d= -f2-)
+    DB_NAME=$(grep -E '^DB_DATABASE=' "$ENVF" | head -n1 | cut -d= -f2-)
+    DB_USER=$(grep -E '^DB_USERNAME=' "$ENVF" | head -n1 | cut -d= -f2-)
+    DB_PASS=$(grep -E '^DB_PASSWORD=' "$ENVF" | head -n1 | cut -d= -f2-)
+
+    echo "[Restore] Preparando DB: $DB_NAME@$DB_HOST (user=$DB_USER)"
+
+    # Crear DB/usuario si no existen (usando root por socket)
+    sudo mysql -uroot -e "CREATE DATABASE IF NOT EXISTS \\\`${DB_NAME}\\\\\`;"
+    sudo mysql -uroot -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'${DB_HOST}' IDENTIFIED BY '${DB_PASS}';" || true
+    sudo mysql -uroot -e "GRANT ALL PRIVILEGES ON \\\`${DB_NAME}\\\\\`.* TO '${DB_USER}'@'${DB_HOST}' WITH GRANT OPTION;"
+    sudo mysql -uroot -e "FLUSH PRIVILEGES;"
+
+    # Importar dump (si existe)
+    if [ -f "$SRC_DUMP" ]; then
+      echo "[Restore] Importando dump lógico…"
+      gunzip -c "$SRC_DUMP" | mysql -h"$DB_HOST" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME"
+      echo "[Restore] Import OK."
+    else
+      # Alternativa: si el dump vino dentro de la carpeta Paymenter completa (.sup-dumps)
+      if [ -f "${pmtr_path}/.sup-dumps/sup-db.sql.gz" ]; then
+        echo "[Restore] Importando dump lógico desde .sup-dumps…"
+        gunzip -c "${pmtr_path}/.sup-dumps/sup-db.sql.gz" | mysql -h"$DB_HOST" -u"$DB_USER" -p"$DB_PASS" "$DB_NAME"
+        echo "[Restore] Import OK."
+      else
+        echo "[Restore] No se encontró dump; salto import."
+      fi
+    fi
+
+    # Permisos
+    if id www-data >/dev/null 2>&1; then
+      chown -R www-data:www-data "${pmtr_path}"
+      find "${pmtr_path}" -type d -exec chmod 755 {} \\;
+      find "${pmtr_path}" -type f -exec chmod 644 {} \\;
+    fi
+
+    # Limpieza cachés Laravel (si existe artisan)
+    if [ -f "${pmtr_path}/artisan" ]; then
+      cd "${pmtr_path}"
+      php artisan optimize:clear || true
+      php artisan view:clear || true
+      php artisan route:clear || true
+      php artisan config:clear || true
+    fi
+  `;
+}
+
+// ===== BACKUP =====
+async function doBackup(serverRow, job, backupRecordId, kind = "full") {
+  const { id: server_id, ip, ssh_user, ssh_pass, pmtr_path, db_host, db_name, db_user, db_pass } = serverRow;
+
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
-  const remoteTmp = `/tmp/sup-backup-${ts}.tgz`;
+  const remoteTmp = `/tmp/pmtr-backup-${kind}-${ts}.tgz`;
   const localDir = ensureServerDir(server_id);
   const localFile = path.join(localDir, path.basename(remoteTmp));
 
-  db.prepare(`UPDATE backups SET filename = ? WHERE id = ?`).run(path.basename(localFile), backupRecordId);
-  logJob(job, `Iniciando backup de ${ip} (${isLocalIP(ip) ? "local" : "remoto"})…`);
-
-  const EX_ALWAYS_ABS = buildBackupExcludeFlagsAbs();
+  db.prepare(`UPDATE backups SET filename = ?, type = ? WHERE id = ?`).run(path.basename(localFile), kind, backupRecordId);
+  logJob(job, `Iniciando backup ${kind.toUpperCase()} de ${ip} (${isLocalIP(ip) ? "local" : "remoto"})…`);
   job.percent = 5;
 
   try {
     if (isLocalIP(ip)) {
-      const excludeSelf = `--exclude='${BACKUP_DIR.replace(/'/g, "'\\''")}'`;
-      const tarLocalCmd = `
-        if command -v pigz >/dev/null 2>&1; then
-          nice -n ${NICE} ionice -c ${IONICE_CLASS} \
-          tar --numeric-owner --xattrs --acls --one-file-system -cpf - \
-            --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-            --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/lost+found \
-            ${EX_ALWAYS_ABS} ${excludeSelf} / | pigz -1 > '${localFile}';
-        else
-          nice -n ${NICE} ionice -c ${IONICE_CLASS} \
-          tar --numeric-owner --xattrs --acls --one-file-system -czpf '${localFile}' \
-            --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-            --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/lost+found \
-            ${EX_ALWAYS_ABS} ${excludeSelf} /;
-        fi
-      `;
-      await run("bash", ["-lc", tarLocalCmd]);
+      // Local
+      const script = (kind === "db")
+        ? buildRemoteDbOnlyBackupScript({ pmtr_path, db_host, db_name, db_user, db_pass }, `'${localFile}'`)
+        : buildRemoteFullBackupScript({ pmtr_path, db_host, db_name, db_user, db_pass }, `'${localFile}'`);
+      await run("bash", ["-lc", script]);
       logJob(job, `Archivo local creado: ${localFile}`);
-      job.percent = 85;
+      job.percent = 90;
     } else {
+      // Remoto
       await sshPrepareHost(ip);
-      const tarRemoteCmd = `
-        if command -v pigz >/dev/null 2>&1; then
-          nice -n ${NICE} ionice -c ${IONICE_CLASS} \
-          tar --numeric-owner --xattrs --acls --one-file-system -cpf - \
-            --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-            --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/lost+found \
-            ${EX_ALWAYS_ABS} / | pigz -1 > ${remoteTmp};
-        else
-          nice -n ${NICE} ionice -c ${IONICE_CLASS} \
-          tar --numeric-owner --xattrs --acls --one-file-system -czpf ${remoteTmp} \
-            --exclude=/proc --exclude=/sys --exclude=/dev --exclude=/run \
-            --exclude=/tmp --exclude=/mnt --exclude=/media --exclude=/lost+found \
-            ${EX_ALWAYS_ABS} /;
-        fi
-      `;
-      await run("env", ["sshpass","-e","ssh","-o","StrictHostKeyChecking=no", `${ssh_user}@${ip}`, tarRemoteCmd],
+      const remoteScript = (kind === "db")
+        ? buildRemoteDbOnlyBackupScript({ pmtr_path, db_host, db_name, db_user, db_pass }, remoteTmp)
+        : buildRemoteFullBackupScript({ pmtr_path, db_host, db_name, db_user, db_pass }, remoteTmp);
+
+      await run("env", ["sshpass","-e","ssh","-o","StrictHostKeyChecking=no", `${ssh_user}@${ip}`, remoteScript],
         { env: { ...process.env, SSHPASS: ssh_pass }});
       logJob(job, `Archivo remoto creado: ${remoteTmp}`);
       job.percent = 35;
@@ -318,7 +478,7 @@ async function doBackup(serverRow, job, backupRecordId) {
         onStderr: s => { const p = parseScpPercent(s); if (p != null) job.percent = 35 + Math.floor(p * 0.5); }
       });
       logJob(job, `Descargado a: ${localFile}`);
-      job.percent = Math.max(job.percent, 85);
+      job.percent = Math.max(job.percent, 90);
 
       await sshPrepareHost(ip);
       await run("env", ["sshpass","-e","ssh","-o","StrictHostKeyChecking=no", `${ssh_user}@${ip}`, `rm -f ${remoteTmp}`],
@@ -330,7 +490,7 @@ async function doBackup(serverRow, job, backupRecordId) {
     throw e;
   }
 
-  const size = fs.statSync(localFile).size;
+  const size = fs.existsSync(localFile) ? fs.statSync(localFile).size : 0;
   db.prepare(`UPDATE backups SET size_bytes = ?, status = 'done' WHERE id = ?`).run(size, backupRecordId);
   db.prepare(`UPDATE servers SET last_run = datetime('now') WHERE id = ?`).run(server_id);
 
@@ -343,11 +503,15 @@ async function doBackup(serverRow, job, backupRecordId) {
   }
 
   job.percent = 100;
-  logJob(job, `Backup finalizado (${(size/1e9).toFixed(2)} GB)`);
+  logJob(job, `Backup ${kind.toUpperCase()} finalizado (${(size/1e9).toFixed(2)} GB)`);
 }
 
-// ===== Restore =====
-async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PRESERVE_AUTH_DEFAULT, preserveNet = PRESERVE_NET_DEFAULT, cleanMode = CLEAN_RESTORE_DEFAULT }, job) {
+// ===== RESTORE =====
+async function doRestore({
+  backupRow, target, restoreRecordId,
+  preserveAuth = PRESERVE_AUTH_DEFAULT, preserveNet = PRESERVE_NET_DEFAULT,
+  cleanMode = CLEAN_RESTORE_DEFAULT
+}, job) {
   const srv = db.prepare("SELECT * FROM servers WHERE id = ?").get(backupRow.server_id);
   if (!srv) throw new Error("Servidor de origen no encontrado");
 
@@ -360,62 +524,70 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
   const targetUser = mode === "same" ? srv.ssh_user : (target.ssh_user || "root");
   const targetPass = mode === "same" ? srv.ssh_pass : target.ssh_pass;
 
-  const EX_TAR_RESTORE = buildRestoreExcludeFlags(preserveAuth, preserveNet);
-  const EX_RSYNC = buildRsyncExcludeFlags(preserveAuth, preserveNet);
-
-  if (preserveAuth) logJob(job, "Preservando SSH/usuarios (no se pisan contraseñas/llaves).");
-  if (preserveNet)  logJob(job, "Preservando RED/hostname (no se tocan netplan/hosts/resolv.conf/fstab).");
-  logJob(job, cleanMode ? "Modo limpieza: rsync --delete." : "Modo normal: tar (sin borrar extras).");
-
-  logJob(job, `Restaurando en ${targetIP} (${isLocalIP(targetIP) ? "local" : "remoto"})…`);
+  const kind = backupRow.type || "full";
+  logJob(job, `Restaurando ${kind.toUpperCase()} en ${targetIP} (${isLocalIP(targetIP) ? "local" : "remoto"})…`);
   job.percent = 5;
 
+  // Donde subimos/extract temporal
+  const remoteTmp = `/tmp/restore-${Date.now()}.tgz`;
+  const remoteWork = `/tmp/pmtr-restore`;
+
+  // Scripts
+  const depsScript = buildDepsScript();
+  const importDbScript = buildDbImportScript(srv.pmtr_path);
+
   if (isLocalIP(targetIP)) {
+    // LOCAL
     try {
-      if (cleanMode) {
-        const script = `
-          set -e
-          TMPD=$(mktemp -d /tmp/rest.$RANDOM.XXXX)
-          tar -xzpf '${localFile}' -C "$TMPD" --same-owner --numeric-owner --xattrs --acls
-          if command -v rsync >/dev/null 2>&1; then
-            rsync -aHAX --numeric-ids --delete --inplace --info=stats2,progress2 --omit-dir-times ${EX_RSYNC} "$TMPD"/ /
-          else
-            echo "rsync no disponible; restaurando con tar (sin borrar extras)"
-            tar -xzpf '${localFile}' -C / --same-owner --numeric-owner --xattrs --acls ${EX_TAR_RESTORE}
-          fi
-          rm -rf "$TMPD"
-        `;
-        await run("bash", ["-lc", script]);
-      } else {
-        await run("bash", ["-lc", `tar -xzpf '${localFile}' -C / --same-owner --numeric-owner --xattrs --acls ${EX_TAR_RESTORE}`]);
+      // Instalar deps
+      await run("bash", ["-lc", depsScript]);
+
+      // Preparar directorio de trabajo
+      await run("bash", ["-lc", `rm -rf '${remoteWork}' && mkdir -p '${remoteWork}'`]);
+
+      // Extraer
+      await run("bash", ["-lc", `tar -xzpf '${localFile}' -C '${remoteWork}' --same-owner --numeric-owner --xattrs --acls || true`]);
+
+      if (kind === "full") {
+        // Detectar nombre de carpeta extraída (paymenter)
+        const detect = await run("bash", ["-lc", `ls -1 '${remoteWork}' | head -n1`]);
+        const extracted = detect.stdout.trim() || "paymenter";
+        const src = path.posix.join(remoteWork, extracted);
+        const dst = srv.pmtr_path;
+
+        // Sobrescribir Paymenter
+        await run("bash", ["-lc", `mkdir -p "$(dirname '${dst}')" && rm -rf '${dst}' && mv '${src}' '${dst}'`]);
       }
-      job.percent = 95;
-      logJob(job, `Extracción local completa.`);
+
+      // Import DB + colocar .env
+      await run("bash", ["-lc", importDbScript], {});
+
+      job.percent = 100;
+      logJob(job, `Restauración local OK.`);
+      if (restoreRecordId) db.prepare(`UPDATE restores SET status='done', note=? WHERE id=?`).run(
+        `${kind}+${cleanMode?'clean+':''}${preserveAuth?'auth_preserved':'auth_overwritten'}`, restoreRecordId
+      );
+      return;
     } catch (e) {
       logJob(job, `Fallo al restaurar local: ${e.stderr || e.message}`);
       throw e;
     }
-    job.percent = 100;
-    logJob(job, `Restauración lista. Recomiendo reiniciar.`);
-    if (restoreRecordId) db.prepare(`UPDATE restores SET status='done', note=? WHERE id=?`).run(
-      `${cleanMode?'clean+':''}${preserveAuth?'auth_preserved':'auth_overwritten'}`, restoreRecordId
-    );
-    return;
   }
 
-  const remoteTmp = `/tmp/restore-${Date.now()}.tgz`;
-
+  // REMOTO
   try {
     await sshPrepareHost(targetIP);
+
+    // Subir tar
     const scpUp = ["sshpass","-e","scp","-o","StrictHostKeyChecking=no"];
     if (SCP_LIMIT_KBPS > 0) scpUp.push("-l", String(SCP_LIMIT_KBPS));
     scpUp.push(localFile, `${targetUser}@${targetIP}:${remoteTmp}`);
     await run("env", scpUp, {
       env: { ...process.env, SSHPASS: targetPass },
-      onStderr: s => { const p = parseScpPercent(s); if (p != null) job.percent = 5 + Math.floor(p * 0.5); }
+      onStderr: s => { const p = parseScpPercent(s); if (p != null) job.percent = 5 + Math.floor(p * 0.4); }
     });
     logJob(job, `Subido ${path.basename(localFile)} a remoto`);
-    job.percent = Math.max(job.percent, 55);
+    job.percent = Math.max(job.percent, 45);
   } catch (e) {
     logJob(job, `Fallo al subir: ${e.stderr || e.message}`);
     throw e;
@@ -423,39 +595,61 @@ async function doRestore({ backupRow, target, restoreRecordId, preserveAuth = PR
 
   try {
     await sshPrepareHost(targetIP);
-    const remoteScript = cleanMode ? `
+
+    // Script remoto: deps + extraer + mover + importar DB + limpiar
+    const remoteScript = `
       set -e
-      TMPD=$(mktemp -d /tmp/rest.$RANDOM.XXXX)
-      tar -xzpf ${remoteTmp} -C "$TMPD" --same-owner --numeric-owner --xattrs --acls
-      if command -v rsync >/dev/null 2>&1; then
-        rsync -aHAX --numeric-ids --delete --inplace --info=stats2,progress2 --omit-dir-times ${EX_RSYNC} "$TMPD"/ /
-      else
-        echo "rsync no disponible; restaurando con tar (sin borrar extras)"
-        tar -xzpf ${remoteTmp} -C / --same-owner --numeric-owner --xattrs --acls ${EX_TAR_RESTORE}
-      fi
-      rm -rf "$TMPD" ${remoteTmp}
-    ` : `
-      set -e
-      tar -xzpf ${remoteTmp} -C / --same-owner --numeric-owner --xattrs --acls ${EX_TAR_RESTORE}
+      ${depsScript}
+
+      rm -rf '${remoteWork}'
+      mkdir -p '${remoteWork}'
+      tar -xzpf ${remoteTmp} -C '${remoteWork}' --same-owner --numeric-owner --xattrs --acls || true
       rm -f ${remoteTmp}
+
+      ${kind === "full" ? `
+        # Detectar carpeta de Paymenter extraída
+        EXTR="$(ls -1 '${remoteWork}' | head -n1 || echo 'paymenter')"
+        SRC="${remoteWork}/$EXTR"
+        DST="${srv.pmtr_path}"
+        sudo mkdir -p "$(dirname "$DST")"
+        sudo rm -rf "$DST"
+        sudo mv "$SRC" "$DST"
+      ` : `
+        # DB-only: nada que mover, solo .env/dump dentro de ${remoteWork}
+      `}
+
+      # Mover .env/dump a /tmp/pmtr-restore para import
+      sudo rm -rf /tmp/pmtr-restore
+      sudo mkdir -p /tmp/pmtr-restore
+      if [ -f '${remoteWork}/pmtr-db.sql.gz' ]; then sudo mv '${remoteWork}/pmtr-db.sql.gz' /tmp/pmtr-restore/; fi
+      if [ -f '${remoteWork}/.env' ]; then sudo mv '${remoteWork}/.env' /tmp/pmtr-restore/; fi
+
+      ${importDbScript}
+
+      # Limpieza
+      sudo rm -rf '${remoteWork}'
     `;
+
     await run("env", ["sshpass","-e","ssh","-o","StrictHostKeyChecking=no", `${targetUser}@${targetIP}`, remoteScript],
       { env: { ...process.env, SSHPASS: targetPass }});
-    job.percent = 95;
-    logJob(job, `Extracción completa.`);
+    job.percent = 98;
+    logJob(job, `Extracción/instalación/import remotos OK.`);
   } catch (e) {
-    logJob(job, `Fallo al extraer: ${e.stderr || e.message}`);
+    logJob(job, `Fallo al extraer/importar: ${e.stderr || e.message}`);
     throw e;
   }
 
   job.percent = 100;
   if (restoreRecordId) db.prepare(`UPDATE restores SET status='done', note=? WHERE id=?`).run(
-    `${cleanMode?'clean+':''}${preserveAuth?'auth_preserved':'auth_overwritten'}`, restoreRecordId
+    `${kind}+${cleanMode?'clean+':''}${preserveAuth?'auth_preserved':'auth_overwritten'}`, restoreRecordId
   );
 }
 
 // ===== Scheduler =====
-function clearTimer(serverId) { const t = timers.get(serverId); if (t) { clearInterval(t); timers.delete(serverId); } }
+function clearTimer(serverId) {
+  const t = timers.get(serverId);
+  if (t) { clearInterval(t); timers.delete(serverId); }
+}
 function startTimer(serverRow) {
   clearTimer(serverRow.id);
   if (!serverRow.enabled || !serverRow.interval_ms) return;
@@ -466,11 +660,12 @@ function startTimer(serverRow) {
     if (!row || !row.enabled) return;
 
     const job = newJob("backup", row.id);
-    logJob(job, `Backup automático…`);
+    logJob(job, `Backup automático (FULL Paymenter)…`);
+
     try {
       const filename = `auto-${new Date().toISOString().replace(/[:.]/g,"-")}.tgz`;
-      const ins = db.prepare(`INSERT INTO backups (server_id, filename, status) VALUES (?,?, 'running')`).run(row.id, filename);
-      await doBackup(row, job, ins.lastInsertRowid);
+      const ins = db.prepare(`INSERT INTO backups (server_id, filename, status, type) VALUES (?,?, 'running','full')`).run(row.id, filename);
+      await doBackup(row, job, ins.lastInsertRowid, "full");
       finishJob(job, true, "Backup automático ok.");
     } catch (e) {
       finishJob(job, false, `Error: ${e.message}`);
@@ -488,26 +683,31 @@ function startTimer(serverRow) {
 }
 (function bootTimers(){ db.prepare("SELECT * FROM servers").all().forEach(startTimer); })();
 
-// ===== API + UI =====
+// ===== API + UI (backend JSON) =====
 function createPanelRouter({ ensureAuth } = {}) {
   const router = express.Router();
   router.use((req, res, next) => ensureAuth ? ensureAuth(req, res, next) : next());
   router.use(express.json());
 
-  // Página UI
-  router.get("/panel", (req, res) => res.type("html").send(renderPanelPage()));
-
-  // ---- Servidores ----
+  // --- Servidores ---
   router.get("/api/servers", (req, res) => {
     const rows = db.prepare(`
-      SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run,created_at,updated_at
+      SELECT id,label,ip,ssh_user,pmtr_path,db_host,db_name,db_user,
+             schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run,created_at,updated_at
       FROM servers ORDER BY id ASC
     `).all();
+    // OJO: no devolvemos db_pass por seguridad
     res.json({ servers: rows });
   });
 
   router.post("/api/servers", (req, res) => {
-    const { label = "", ip = "", ssh_user = "root", ssh_pass = "", schedule_key = "off", enabled = false, retention_key = "off" } = req.body || {};
+    const {
+      label = "", ip = "", ssh_user = "root", ssh_pass = "",
+      pmtr_path = "/var/www/paymenter",
+      db_host = "127.0.0.1", db_name = "paymenter", db_user = "paymenter", db_pass = "",
+      schedule_key = "off", enabled = false, retention_key = "off"
+    } = req.body || {};
+
     if (!ip || (!isLocalIP(ip) && !ssh_pass)) return res.status(400).json({ error: "ip y ssh_pass son requeridos (127.0.0.1 no usa ssh_pass)" });
 
     const interval_ms = msFromKey(schedule_key);
@@ -515,21 +715,26 @@ function createPanelRouter({ ensureAuth } = {}) {
     const next_run = interval_ms ? computeNextRun(interval_ms) : null;
 
     const info = db.prepare(`
-      INSERT INTO servers (label, ip, ssh_user, ssh_pass, schedule_key, interval_ms, enabled, retention_key, retention_ms, next_run)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(label.trim(), ip.trim(), (ssh_user || "root").trim(), ssh_pass, schedule_key, interval_ms, enabled ? 1 : 0, retention_key, retention_ms, next_run);
+      INSERT INTO servers (label, ip, ssh_user, ssh_pass, pmtr_path, db_host, db_name, db_user, db_pass,
+                           schedule_key, interval_ms, enabled, retention_key, retention_ms, next_run)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(label.trim(), ip.trim(), (ssh_user || "root").trim(), ssh_pass,
+           pmtr_path.trim(), db_host.trim(), db_name.trim(), db_user.trim(), db_pass,
+           schedule_key, interval_ms, enabled ? 1 : 0, retention_key, retention_ms, next_run);
 
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(info.lastInsertRowid);
     startTimer(row);
+
     res.json({ server: {
       id: row.id, label: row.label, ip: row.ip, ssh_user: row.ssh_user,
+      pmtr_path: row.pmtr_path, db_host: row.db_host, db_name: row.db_name, db_user: row.db_user,
       schedule_key: row.schedule_key, interval_ms: row.interval_ms, enabled: !!row.enabled,
       retention_key: row.retention_key, retention_ms: row.retention_ms,
       last_run: row.last_run, next_run: row.next_run
     }});
   });
 
-  // Actualizar configuración (programa, retención, enabled, label)
+  // Actualizar programa/retención/label/enabled
   router.put("/api/servers/:id", (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
@@ -560,15 +765,17 @@ function createPanelRouter({ ensureAuth } = {}) {
     db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
     const updated = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
     startTimer(updated);
+
     res.json({ server: {
       id: updated.id, label: updated.label, ip: updated.ip, ssh_user: updated.ssh_user,
+      pmtr_path: updated.pmtr_path, db_host: updated.db_host, db_name: updated.db_name, db_user: updated.db_user,
       schedule_key: updated.schedule_key, interval_ms: updated.interval_ms, enabled: !!updated.enabled,
       retention_key: updated.retention_key, retention_ms: updated.retention_ms,
       last_run: updated.last_run, next_run: updated.next_run
     }});
   });
 
-  // Actualizar sólo credenciales SSH
+  // Actualizar solo credenciales SSH
   router.put("/api/servers/:id/creds", (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
@@ -576,14 +783,33 @@ function createPanelRouter({ ensureAuth } = {}) {
 
     const { ssh_user, ssh_pass } = req.body || {};
     const updates = [], params = [];
-
     if (typeof ssh_user === "string" && ssh_user.trim()) { updates.push("ssh_user = ?"); params.push(ssh_user.trim()); }
     if (typeof ssh_pass === "string" && ssh_pass.length)   { updates.push("ssh_pass = ?"); params.push(ssh_pass); }
+    if (!updates.length) return res.status(400).json({ error: "Nada para actualizar" });
+
+    db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
+    const updated = db.prepare("SELECT id,label,ip,ssh_user,pmtr_path,db_host,db_name,db_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run FROM servers WHERE id = ?").get(id);
+    res.json({ server: updated });
+  });
+
+  // Actualizar Paymenter path y credenciales DB
+  router.put("/api/servers/:id/paymenter", (req, res) => {
+    const id = +req.params.id;
+    const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
+    if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+
+    const { pmtr_path, db_host, db_name, db_user, db_pass } = req.body || {};
+    const updates = [], params = [];
+    if (typeof pmtr_path === "string" && pmtr_path.trim()) { updates.push("pmtr_path = ?"); params.push(pmtr_path.trim()); }
+    if (typeof db_host   === "string" && db_host.trim())   { updates.push("db_host = ?");   params.push(db_host.trim()); }
+    if (typeof db_name   === "string" && db_name.trim())   { updates.push("db_name = ?");   params.push(db_name.trim()); }
+    if (typeof db_user   === "string" && db_user.trim())   { updates.push("db_user = ?");   params.push(db_user.trim()); }
+    if (typeof db_pass   === "string")                     { updates.push("db_pass = ?");   params.push(db_pass); }
 
     if (!updates.length) return res.status(400).json({ error: "Nada para actualizar" });
 
     db.prepare(`UPDATE servers SET ${updates.join(", ")} WHERE id = ?`).run(...params, id);
-    const updated = db.prepare("SELECT id,label,ip,ssh_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run FROM servers WHERE id = ?").get(id);
+    const updated = db.prepare("SELECT id,label,ip,ssh_user,pmtr_path,db_host,db_name,db_user,schedule_key,interval_ms,enabled,retention_key,retention_ms,last_run,next_run FROM servers WHERE id = ?").get(id);
     res.json({ server: updated });
   });
 
@@ -591,8 +817,10 @@ function createPanelRouter({ ensureAuth } = {}) {
     const id = +req.params.id;
     const active = Array.from(jobs.values()).some(j => j.server_id === id && j.status === "running");
     if (active) return res.status(409).json({ error: "Hay un proceso en ejecución" });
+
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
     if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+
     clearTimer(id);
     db.prepare("DELETE FROM servers WHERE id = ?").run(id);
     const dir = path.join(BACKUP_DIR, `server_${id}`);
@@ -600,21 +828,26 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ ok: true });
   });
 
-  // ---- Backups ----
+  // --- Backups ---
   router.post("/api/servers/:id/backup-now", async (req, res) => {
     const id = +req.params.id;
     const row = db.prepare("SELECT * FROM servers WHERE id = ?").get(id);
     if (!row) return res.status(404).json({ error: "Servidor no encontrado" });
+
+    const { kind = "full" } = req.body || {}; // 'db' | 'full'
+    if (!["db","full"].includes(kind)) return res.status(400).json({ error: "kind inválido (db|full)" });
+
     const already = Array.from(jobs.values()).find(j => j.server_id === id && j.type === "backup" && j.status === "running");
     if (already) return res.status(409).json({ error: "Ya hay un backup en curso", job_id: already.id });
 
     const job = newJob("backup", id);
-    const filename = `manual-${new Date().toISOString().replace(/[:.]/g,"-")}.tgz`;
-    const ins = db.prepare(`INSERT INTO backups (server_id, filename, status) VALUES (?,?, 'running')`).run(id, filename);
-    res.json({ job_id: job.id });
+    job.extra.kind = kind;
+    const filename = `manual-${kind}-${new Date().toISOString().replace(/[:.]/g,"-")}.tgz`;
+    const ins = db.prepare(`INSERT INTO backups (server_id, filename, status, type) VALUES (?,?, 'running', ?)`).run(id, filename, kind);
 
+    res.json({ job_id: job.id });
     (async () => {
-      try { await doBackup(row, job, ins.lastInsertRowid); finishJob(job, true, "Backup manual finalizado."); }
+      try { await doBackup(row, job, ins.lastInsertRowid, kind); finishJob(job, true, "Backup manual finalizado."); }
       catch (e) { finishJob(job, false, `Error: ${e.message}`); db.prepare(`UPDATE backups SET status = 'failed' WHERE id = ?`).run(ins.lastInsertRowid); }
     })();
   });
@@ -630,7 +863,7 @@ function createPanelRouter({ ensureAuth } = {}) {
 
   router.get("/api/backups", (req, res) => {
     const sid = +req.query.server_id;
-    const rows = db.prepare("SELECT id, filename, size_bytes, status, created_at FROM backups WHERE server_id = ? ORDER BY id DESC").all(sid);
+    const rows = db.prepare("SELECT id, filename, size_bytes, status, type, created_at FROM backups WHERE server_id = ? ORDER BY id DESC").all(sid);
     res.json({ backups: rows });
   });
 
@@ -651,13 +884,14 @@ function createPanelRouter({ ensureAuth } = {}) {
     res.json({ ok: true });
   });
 
-  // ---- Restore ----
+  // --- Restore ---
   router.post("/api/restore", async (req, res) => {
     const { backup_id, mode, ip, ssh_user = "root", ssh_pass, preserve_auth } = req.body || {};
     if (!backup_id) return res.status(400).json({ error: "backup_id requerido" });
 
     const b = db.prepare("SELECT * FROM backups WHERE id = ?").get(+backup_id);
     if (!b) return res.status(404).json({ error: "Backup no encontrado" });
+
     if (mode !== "same" && (!ip || !ssh_pass)) return res.status(400).json({ error: "Para otra VPS: ip y ssh_pass requeridos" });
 
     const srcSrv = db.prepare("SELECT * FROM servers WHERE id = ?").get(b.server_id);
@@ -674,8 +908,8 @@ function createPanelRouter({ ensureAuth } = {}) {
       INSERT INTO restores (backup_id, server_id_from, mode, target_ip, target_user, target_server_id, preserve_auth, status)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'running')
     `).run(b.id, b.server_id, mode, mode === "same" ? null : ip, mode === "same" ? null : ssh_user, target_server_id, preserveAuthFlag);
-    job.extra.restore_id = restIns.lastInsertRowid;
 
+    job.extra.restore_id = restIns.lastInsertRowid;
     res.json({ job_id: job.id });
 
     (async () => {
@@ -684,7 +918,7 @@ function createPanelRouter({ ensureAuth } = {}) {
           { backupRow: b, target: mode === "same" ? { mode } : { mode, ip, ssh_user, ssh_pass }, restoreRecordId: restIns.lastInsertRowid, preserveAuth: !!preserveAuthFlag },
           job
         );
-        finishJob(job, true, "Restauración completada. Recomiendo reiniciar.");
+        finishJob(job, true, "Restauración completada.");
       } catch (e) {
         finishJob(job, false, `Error: ${e.message}`);
         if (restIns?.lastInsertRowid) db.prepare(`UPDATE restores SET status='failed', note=? WHERE id=?`).run(String(e.message || "error"), restIns.lastInsertRowid);
@@ -712,7 +946,7 @@ function createPanelRouter({ ensureAuth } = {}) {
     const sid = +req.query.server_id;
     const rows = db.prepare(`
       SELECT r.id, r.backup_id, r.mode, r.target_ip, r.target_user, r.status, r.created_at, r.preserve_auth, r.note,
-             b.filename,
+             b.filename, b.type,
              sf.label  AS source_label, sf.ip AS source_ip,
              st.label  AS target_label, st.ip AS target_ip2
       FROM restores r
@@ -737,441 +971,5 @@ function createPanelRouter({ ensureAuth } = {}) {
   return router;
 }
 
-// ===== UI (sin backticks dentro del <script>) =====
-function renderPanelPage() {
-  return `<!DOCTYPE html>
-<html lang="es">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>SkyUltraPlus — Panel de Backups</title>
-<style>
-  :root { --bg:#fff; --fg:#0f172a; --muted:#64748b; --ring:#e5e7eb; --primary:#111827; --accent:#2563eb; --ok:#16a34a; --bad:#ef4444; }
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial}
-  header{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--ring)}
-  header img{width:40px;height:40px} h1{font-size:18px;margin:0} .sub{font-size:12px;color:var(--muted)}
-  main{max-width:1100px;margin:0 auto;padding:20px;display:grid;gap:18px}
-  .card{border:1px solid var(--ring);border-radius:12px;padding:16px}
-  .row{display:grid;gap:10px} .grid{display:grid;gap:12px} .grid.cols-2{grid-template-columns:1fr 1fr}
-  label{font-size:12px;color:var(--muted)} input,select{width:100%;padding:10px 12px;border:1px solid var(--ring);border-radius:10px;font-size:14px}
-  button{padding:10px 12px;border:none;border-radius:10px;background:var(--primary);color:#fff;font-weight:600;cursor:pointer}
-  button.secondary{background:#334155} button.link{background:transparent;color:var(--accent);padding:0}
-  table{width:100%;border-collapse:collapse} th,td{padding:10px;border-bottom:1px solid var(--ring);text-align:left;font-size:14px}
-  .small{font-size:12px;color:var(--muted)} .chip{display:inline-block;padding:4px 8px;border-radius:999px;font-size:12px;border:1px solid var(--ring)}
-  .on{background:#ecfdf5;color:#065f46;border-color:#a7f3d0} .off{background:#fef2f2;color:#991b1b;border-color:#fecaca}
-  .bar{height:8px;background:#f1f5f9;border-radius:999px;overflow:hidden} .bar>span{display:block;height:100%;background:linear-gradient(90deg,#60a5fa,#2563eb)}
-  .flex{display:flex;gap:10px;align-items:center;flex-wrap:wrap} .right{justify-content:flex-end}
-  .state{font-weight:700}
-  .ok{color:var(--ok)} .bad{color:var(--bad)}
-</style>
-</head>
-<body>
-<header>
-  <img src="https://cdn.russellxz.click/3c8ab72a.png" alt="logo">
-  <div><h1>Sistema de Backup SkyUltraPlus</h1><div class="sub">Preserva SSH y RED por defecto · Limpieza activa + Retención · Huella SSH auto-limpieza</div></div>
-  <div style="flex:1"></div>
-  <form method="post" action="/logout"><button class="secondary">Salir</button></form>
-  <a href="/usuarios"><button class="secondary">Usuarios</button></a>
-</header>
-
-<main>
-  <section class="card">
-    <h2 style="margin:0 0 10px;font-size:16px">Agregar VPS</h2>
-    <div class="grid cols-2">
-      <div class="row"><label>Etiqueta (opcional)</label><input id="label" placeholder="Mi VPS #1"></div>
-      <div class="row"><label>IP (usa 127.0.0.1 para self-backup)</label><input id="ip" placeholder="45.90.99.19"></div>
-      <div class="row"><label>Usuario SSH</label><input id="ssh_user" value="root"></div>
-      <div class="row"><label>Contraseña SSH</label><input id="ssh_pass" type="password" placeholder="••••••••"></div>
-      <div class="row">
-        <label>Programa</label>
-        <select id="schedule_key">
-          <option value="off">Apagado</option><option value="1h">Cada 1 hora</option><option value="6h">Cada 6 horas</option>
-          <option value="12h">Cada 12 horas</option><option value="1d">Cada día</option><option value="1w">Cada semana</option>
-          <option value="15d">Cada 15 días</option><option value="1m">Cada mes</option>
-        </select>
-      </div>
-      <div class="row">
-        <label>Retención (auto-eliminar backups viejos)</label>
-        <select id="retention_key">
-          <option value="off">No borrar automáticamente</option>
-          <option value="1d">≥ 1 día</option>
-          <option value="3d">≥ 3 días</option>
-          <option value="7d">≥ 7 días</option>
-          <option value="15d">≥ 15 días</option>
-          <option value="30d">≥ 30 días</option>
-          <option value="60d">≥ 60 días</option>
-          <option value="90d">≥ 90 días</option>
-          <option value="180d">≥ 180 días</option>
-          <option value="schedx3">≥ 3× del programa</option>
-          <option value="schedx7">≥ 7× del programa</option>
-        </select>
-      </div>
-      <div class="row" style="align-self:end"><button onclick="addServer()">Agregar</button></div>
-    </div>
-    <div class="small">Requisitos: en este servidor <code>sshpass</code>. En remotos <code>tar</code> y (para limpieza) <code>rsync</code>. Self-backup: IP <strong>127.0.0.1</strong> sin contraseña.</div>
-  </section>
-
-  <section class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <h2 style="margin:0;font-size:16px">Servidores</h2>
-      <div class="small">Cuenta regresiva al próximo backup.</div>
-    </div>
-    <div id="servers-wrap" class="row"></div>
-  </section>
-
-  <section class="card">
-    <h2 style="margin:0 0 10px;font-size:16px">Restaurar backup</h2>
-    <div class="grid cols-2">
-      <div class="row"><label>Servidor (origen)</label><select id="restore_server"></select></div>
-      <div class="row"><label>Backup</label><select id="restore_backup"></select></div>
-      <div class="row">
-        <label>Destino</label>
-        <select id="restore_mode" onchange="toggleRestoreMode()">
-          <option value="same">Misma VPS</option>
-          <option value="other">Otra VPS</option>
-        </select>
-      </div>
-      <div class="row restore-other" style="display:none"><label>IP destino</label><input id="dst_ip" placeholder="1.2.3.4"></div>
-      <div class="row restore-other" style="display:none"><label>Usuario destino</label><input id="dst_user" value="root"></div>
-      <div class="row restore-other" style="display:none"><label>Contraseña destino</label><input id="dst_pass" type="password" placeholder="••••••••"></div>
-      <div class="row" style="align-self:end"><button onclick="restore()">Restaurar</button></div>
-    </div>
-    <div id="restore_job" class="row" style="margin-top:12px;display:none">
-      <div style="display:flex;gap:10px;align-items:center">
-        <div class="bar" style="flex:1"><span id="restore_bar" style="width:0%"></span></div>
-        <div id="restore_state" class="state small"></div>
-      </div>
-      <div id="restore_log" class="small"></div>
-    </div>
-  </section>
-</main>
-
-<script>
-let servers = []; 
-let jobsByServer = {};
-let restoreJobId = null;
-
-function fmt(dt){ if(!dt) return "-"; return new Date(dt).toLocaleString(); }
-function left(ms){ if(ms<=0) return "00:00:00"; const s=Math.floor(ms/1000); const h=String(Math.floor(s/3600)).padStart(2,"0"); const m=String(Math.floor((s%3600)/60)).padStart(2,"0"); const ss=String(s%60).padStart(2,"0"); return h + ":" + m + ":" + ss; }
-function humanRetention(k){
-  const map = {
-    off:"No borrar",
-    "1d":"≥ 1 día","3d":"≥ 3 días","7d":"≥ 7 días","15d":"≥ 15 días","30d":"≥ 30 días",
-    "60d":"≥ 60 días","90d":"≥ 90 días","180d":"≥ 180 días","schedx3":"≥ 3× del programa","schedx7":"≥ 7× del programa"
-  };
-  return map[k] || k || "off";
-}
-
-async function loadServers(){ 
-  const r=await fetch('/api/servers'); const j=await r.json(); 
-  servers=j.servers||[]; 
-  renderServers(); 
-  fillRestoreServers(); 
-  reattachActiveJobs();
-}
-
-function renderServers(){
-  const wrap=document.getElementById('servers-wrap');
-  if(!servers.length){ wrap.innerHTML='<div class="small">No hay servidores configurados.</div>'; return; }
-  wrap.innerHTML='';
-  servers.forEach(function(s){
-    const row=document.createElement('div'); row.className='row';
-
-    var html = '';
-    html += '<div class="grid cols-2" style="align-items:end">';
-    html +=   '<div class="row">';
-    html +=     '<div><strong>' + (s.label || '(sin etiqueta)') + ' — ' + s.ip + '</strong></div>';
-    html +=     '<div class="small">Usuario: ' + s.ssh_user + '</div>';
-    html +=     '<div class="small">Último: ' + fmt(s.last_run) + ' | Próximo: <span data-next="' + (s.next_run || '') + '" class="countdown"></span></div>';
-    html +=     '<div class="small">Programa: ' + s.schedule_key + ' — Estado: <span class="chip ' + (s.enabled?'on':'off') + '">' + (s.enabled?'ON':'OFF') + '</span></div>';
-    html +=     '<div class="small">Retención: <strong>' + humanRetention(s.retention_key) + '</strong></div>';
-    html +=   '</div>';
-    html +=   '<div class="flex right">';
-
-    html +=     '<select id="sch_' + s.id + '">';
-    html +=       '<option value="off"' + (s.schedule_key==='off'?' selected':'') + '>Apagado</option>';
-    html +=       '<option value="1h"' + (s.schedule_key==='1h'?' selected':'') + '>Cada 1 hora</option>';
-    html +=       '<option value="6h"' + (s.schedule_key==='6h'?' selected':'') + '>Cada 6 horas</option>';
-    html +=       '<option value="12h"' + (s.schedule_key==='12h'?' selected':'') + '>Cada 12 horas</option>';
-    html +=       '<option value="1d"' + (s.schedule_key==='1d'?' selected':'') + '>Cada día</option>';
-    html +=       '<option value="1w"' + (s.schedule_key==='1w'?' selected':'') + '>Cada semana</option>';
-    html +=       '<option value="15d"' + (s.schedule_key==='15d'?' selected':'') + '>Cada 15 días</option>';
-    html +=       '<option value="1m"' + (s.schedule_key==='1m'?' selected':'') + '>Cada mes</option>';
-    html +=     '</select>';
-
-    html +=     '<select id="ret_' + s.id + '">';
-    html +=       '<option value="off"'  + (s.retention_key==='off'?' selected':'')  + '>No borrar</option>';
-    html +=       '<option value="1d"'   + (s.retention_key==='1d'?' selected':'')   + '>&ge; 1 día</option>';
-    html +=       '<option value="3d"'   + (s.retention_key==='3d'?' selected':'')   + '>&ge; 3 días</option>';
-    html +=       '<option value="7d"'   + (s.retention_key==='7d'?' selected':'')   + '>&ge; 7 días</option>';
-    html +=       '<option value="15d"'  + (s.retention_key==='15d'?' selected':'')  + '>&ge; 15 días</option>';
-    html +=       '<option value="30d"'  + (s.retention_key==='30d'?' selected':'')  + '>&ge; 30 días</option>';
-    html +=       '<option value="60d"'  + (s.retention_key==='60d'?' selected':'')  + '>&ge; 60 días</option>';
-    html +=       '<option value="90d"'  + (s.retention_key==='90d'?' selected':'')  + '>&ge; 90 días</option>';
-    html +=       '<option value="180d"' + (s.retention_key==='180d'?' selected':'') + '>&ge; 180 días</option>';
-    html +=       '<option value="schedx3"' + (s.retention_key==='schedx3'?' selected':'') + '>&ge; 3× programa</option>';
-    html +=       '<option value="schedx7"' + (s.retention_key==='schedx7'?' selected':'') + '>&ge; 7× programa</option>';
-    html +=     '</select>';
-
-    html +=     '<button onclick="saveSched(' + s.id + ')">Guardar</button>';
-    html +=     '<button onclick="toggleServer(' + s.id + ', ' + (!s.enabled) + ')">' + (s.enabled?'Desactivar':'Activar') + '</button>';
-    html +=     '<button onclick="manual(' + s.id + ')">Backup ahora</button>';
-    html +=     '<button class="secondary" onclick="cleanup(' + s.id + ')">Limpiar ahora</button>';
-    html +=     '<button class="secondary" onclick="editCreds(' + s.id + ')">Credenciales</button>';
-    html +=     '<a class="link" href="#" onclick="loadBackups(' + s.id + ');return false;">Ver backups</a>';
-    html +=     '&nbsp;|&nbsp;';
-    html +=     '<a class="link" href="#" onclick="loadRestores(' + s.id + ');return false;">Ver restauraciones</a>';
-    html +=     '&nbsp;|&nbsp;';
-    html +=     '<button class="secondary" onclick="delServer(' + s.id + ')" style="background:#b91c1c">Eliminar VPS</button>';
-    html +=   '</div>';
-    html += '</div>';
-
-    html += '<div id="bk_' + s.id + '" class="row" style="display:none"></div>';
-    html += '<div id="rst_' + s.id + '" class="row" style="display:none"></div>';
-    html += '<div id="job_' + s.id + '" class="row" style="display:none">';
-    html +=   '<div style="display:flex;gap:10px;align-items:center">';
-    html +=     '<div class="bar" style="flex:1"><span id="bar_' + s.id + '" style="width:0%"></span></div>';
-    html +=     '<div id="state_' + s.id + '" class="state small"></div>';
-    html +=   '</div>';
-    html +=   '<div id="log_' + s.id + '" class="small"></div>';
-    html += '</div>';
-
-    row.innerHTML = html;
-    wrap.appendChild(row);
-  });
-  tickCountdowns();
-}
-
-function tickCountdowns(){
-  const els=document.querySelectorAll('.countdown');
-  els.forEach(function(el){ const nx=el.getAttribute('data-next'); if(!nx){ el.textContent='-'; return; } const ms=new Date(nx)-new Date(); el.textContent=left(ms); });
-  setTimeout(tickCountdowns,1000);
-}
-
-async function addServer(){
-  const body={
-    label:document.getElementById('label').value,
-    ip:document.getElementById('ip').value,
-    ssh_user:document.getElementById('ssh_user').value||'root',
-    ssh_pass:document.getElementById('ssh_pass').value,
-    schedule_key:document.getElementById('schedule_key').value,
-    retention_key:document.getElementById('retention_key').value,
-    enabled:true
-  };
-  const r=await fetch('/api/servers',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json(); if(!r.ok){ alert(j.error||'Error al agregar'); return; }
-  loadServers();
-}
-async function saveSched(id){
-  const key=document.getElementById('sch_'+id).value;
-  const ret=document.getElementById('ret_'+id).value;
-  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({schedule_key:key, retention_key:ret})});
-  if(r.ok) loadServers();
-}
-async function toggleServer(id, enabled){
-  const r=await fetch('/api/servers/'+id,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});
-  if(r.ok) loadServers();
-}
-async function delServer(id){
-  if(!confirm('¿Eliminar esta VPS? Se borrarán configuraciones y backups locales.')) return;
-  const r=await fetch('/api/servers/'+id,{method:'DELETE'});
-  const j=await r.json();
-  if(!r.ok){ alert(j.error||'No se pudo eliminar'); return; }
-  loadServers();
-}
-
-async function manual(id){
-  const r=await fetch('/api/servers/'+id+'/backup-now',{method:'POST'});
-  const j=await r.json(); 
-  if(!r.ok){ 
-    alert(j.error||'Error'); 
-    if (j.job_id){ localStorage.setItem('job_server_'+id, j.job_id); document.getElementById('job_'+id).style.display=''; pollJob(id); }
-    return; 
-  }
-  jobsByServer[id]=j.job_id; 
-  localStorage.setItem('job_server_'+id, j.job_id);
-  document.getElementById('job_'+id).style.display='';
-  pollJob(id);
-}
-async function cleanup(id){
-  const r=await fetch('/api/servers/'+id+'/cleanup',{method:'POST'});
-  const j=await r.json();
-  if(!r.ok){ alert(j.error||'Error'); return; }
-  alert('Limpieza realizada: ' + (j.deleted||0) + ' backup(s) eliminados.');
-  loadServers();
-}
-async function editCreds(id){
-  const s = servers.find(function(x){ return x.id===id; });
-  const user = prompt('Nuevo usuario SSH (dejar vacío para mantener):', (s && s.ssh_user) || 'root');
-  if (user === null) return;
-  const pass = prompt('Nueva contraseña SSH (dejar vacío para mantener la actual):', '');
-  const body = {};
-  if (user && (!s || user !== s.ssh_user)) body.ssh_user = user.trim();
-  if (pass !== null && pass !== '') body.ssh_pass = pass;
-  if (!Object.keys(body).length) { alert('Sin cambios'); return; }
-  const r = await fetch('/api/servers/'+id+'/creds',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j = await r.json();
-  if(!r.ok){ alert(j.error||'Error'); return; }
-  alert('Credenciales actualizadas.');
-  loadServers();
-}
-
-async function pollJob(id){
-  const jobId=jobsByServer[id] || localStorage.getItem('job_server_'+id);
-  if(!jobId) return;
-  const r=await fetch('/api/job/'+jobId); 
-  if(!r.ok){ return; }
-  const j=await r.json();
-  document.getElementById('bar_'+id).style.width=(j.percent||0)+'%';
-  document.getElementById('log_'+id).innerHTML=(j.logs||[]).map(function(l){return l.replace(/</g,'&lt;');}).join('<br>');
-  document.getElementById('job_'+id).style.display='';
-  const stEl=document.getElementById('state_'+id);
-  if (j.status==='done'){ stEl.textContent='OK'; stEl.classList.add('ok'); stEl.classList.remove('bad'); localStorage.removeItem('job_server_'+id); }
-  else if (j.status==='failed'){ stEl.textContent='Fallo'; stEl.classList.add('bad'); stEl.classList.remove('ok'); localStorage.removeItem('job_server_'+id); }
-  else { stEl.textContent='En curso…'; stEl.classList.remove('ok','bad'); }
-  if(j.status==='running') setTimeout(function(){ pollJob(id); },700); else setTimeout(loadServers,800);
-}
-
-async function reattachActiveJobs(){
-  servers.forEach(function(s){
-    const saved = localStorage.getItem('job_server_'+s.id);
-    if (saved){ jobsByServer[s.id]=saved; document.getElementById('job_'+s.id).style.display=''; pollJob(s.id); }
-  });
-  const r=await fetch('/api/jobs/active'); const j=await r.json();
-  (j.active||[]).forEach(function(jb){
-    if (jb.type==='backup'){
-      jobsByServer[jb.server_id]=jb.id;
-      localStorage.setItem('job_server_'+jb.server_id, jb.id);
-      document.getElementById('job_'+jb.server_id).style.display='';
-      pollJob(jb.server_id);
-    } else if (jb.type==='restore'){
-      restoreJobId = jb.id;
-      localStorage.setItem('restore_job', jb.id);
-      document.getElementById('restore_job').style.display='';
-      pollRestore(jb.id);
-    }
-  });
-  const rj = localStorage.getItem('restore_job');
-  if (rj){ restoreJobId = rj; document.getElementById('restore_job').style.display=''; pollRestore(rj); }
-}
-
-async function loadBackups(server_id){
-  const box=document.getElementById('bk_'+server_id); box.style.display='';
-  box.innerHTML='<div class="small">Cargando...</div>';
-  const r=await fetch('/api/backups?server_id='+server_id); const j=await r.json();
-  if(!j.backups || !j.backups.length){ box.innerHTML='<div class="small">Sin backups aún.</div>'; return; }
-  var html='<table><thead><tr><th>ID</th><th>Archivo</th><th>Tamaño</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
-  html += j.backups.map(function(b){
-    const sz=b.size_bytes!=null ? (b.size_bytes/1e9).toFixed(2)+' GB' : '-';
-    const st = b.status === 'done' ? '<span class="ok state">OK</span>' : (b.status === 'failed' ? '<span class="bad state">Fallo</span>' : b.status);
-    return '<tr>'
-      + '<td>' + b.id + '</td>'
-      + '<td>' + b.filename + '</td>'
-      + '<td>' + sz + '</td>'
-      + '<td>' + st + '</td>'
-      + '<td>' + new Date(b.created_at).toLocaleString() + '</td>'
-      + '<td>'
-      +   '<a class="link" href="/api/backups/download/' + b.id + '">Descargar</a>'
-      +   '&nbsp;|&nbsp;<a class="link" href="#" onclick="delBackup(' + b.id + ', ' + server_id + ');return false;">Borrar</a>'
-      + '</td>'
-      + '</tr>';
-  }).join('');
-  html+='</tbody></table>';
-  box.innerHTML=html;
-}
-
-async function loadRestores(server_id){
-  const box=document.getElementById('rst_'+server_id); box.style.display='';
-  box.innerHTML='<div class="small">Cargando...</div>';
-  const r=await fetch('/api/restores?server_id='+server_id); const j=await r.json();
-  if(!j.restores || !j.restores.length){ box.innerHTML='<div class="small">Aún no hay restauraciones.</div>'; return; }
-  var html='<table><thead><tr><th>ID</th><th>Backup</th><th>Origen → Destino</th><th>Modo</th><th>SSH</th><th>Estado</th><th>Fecha</th><th>Acciones</th></tr></thead><tbody>';
-  html += j.restores.map(function(x){
-    const dest = x.mode==='same'
-      ? ((x.target_label || x.source_label || 'Misma VPS'))
-      : (x.target_label ? (x.target_label + (x.target_ip2? ' ('+x.target_ip2+')':'')) : (x.target_ip || '-'));
-    const origin = (x.source_label || '-') + (x.source_ip ? (' ('+x.source_ip+')') : '');
-    const ssh = x.preserve_auth ? '<span class="chip on">Preservado</span>' : '<span class="chip off">Sobrescrito</span>';
-    const st = x.status === 'done' ? '<span class="ok state">OK</span>' : (x.status === 'failed' ? '<span class="bad state">Fallo</span>' : x.status);
-    return '<tr>'
-      + '<td>' + x.id + '</td>'
-      + '<td>' + x.backup_id + ' — ' + x.filename + '</td>'
-      + '<td>' + origin + ' → ' + dest + '</td>'
-      + '<td>' + x.mode + '</td>'
-      + '<td>' + ssh + '</td>'
-      + '<td>' + st + '</td>'
-      + '<td>' + new Date(x.created_at).toLocaleString() + '</td>'
-      + '<td><a class="link" href="#" onclick="delRestore(' + x.id + ', ' + server_id + ');return false;">Borrar registro</a></td>'
-      + '</tr>';
-  }).join('');
-  html+='</tbody></table>';
-  box.innerHTML=html;
-}
-
-async function delBackup(id, server_id){
-  if(!confirm('¿Borrar este backup?')) return;
-  const r=await fetch('/api/backups/'+id,{method:'DELETE'}); if(r.ok) loadBackups(server_id);
-}
-async function delRestore(id, server_id){
-  if(!confirm('¿Borrar este registro de restauración?')) return;
-  const r=await fetch('/api/restores/'+id,{method:'DELETE'}); if(r.ok) loadRestores(server_id);
-}
-
-function fillRestoreServers(){
-  const sel=document.getElementById('restore_server');
-  sel.innerHTML=(servers||[]).map(function(s){
-    const label = s.label || '(sin etiqueta)';
-    return '<option value="' + s.id + '">' + label + ' — ' + s.ip + '</option>';
-  }).join('');
-  if(servers.length) loadRestoreBackups();
-}
-async function loadRestoreBackups(){
-  const sid=document.getElementById('restore_server').value;
-  const r=await fetch('/api/backups?server_id='+sid); const j=await r.json();
-  const sel=document.getElementById('restore_backup');
-  sel.innerHTML=(j.backups||[]).map(function(b){
-    return '<option value="' + b.id + '">' + b.id + ' — ' + b.filename + '</option>';
-  }).join('');
-}
-
-function toggleRestoreMode(){
-  const mode=document.getElementById('restore_mode').value;
-  document.querySelectorAll('.restore-other').forEach(function(e){ e.style.display=(mode==='other')?'':'none'; });
-}
-
-async function restore(){
-  const backup_id=document.getElementById('restore_backup').value;
-  const mode=document.getElementById('restore_mode').value;
-  const body={ backup_id: backup_id, mode: mode };
-  if(mode==='other'){
-    body.ip=document.getElementById('dst_ip').value;
-    body.ssh_user=document.getElementById('dst_user').value || 'root';
-    body.ssh_pass=document.getElementById('dst_pass').value;
-  }
-  const r=await fetch('/api/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  const j=await r.json(); if(!r.ok){ alert(j.error||'Error'); return; }
-  restoreJobId = j.job_id;
-  localStorage.setItem('restore_job', j.job_id);
-  document.getElementById('restore_job').style.display='';
-  pollRestore(j.job_id);
-}
-async function pollRestore(jobId){
-  const r=await fetch('/api/job/'+jobId); if(!r.ok) return;
-  const j=await r.json();
-  document.getElementById('restore_bar').style.width=(j.percent||0)+'%';
-  document.getElementById('restore_log').innerHTML=(j.logs||[]).map(function(l){return l.replace(/</g,'&lt;');}).join('<br>');
-  const stEl=document.getElementById('restore_state');
-  if (j.status==='done'){ stEl.textContent='OK'; stEl.classList.add('ok'); stEl.classList.remove('bad'); localStorage.removeItem('restore_job'); }
-  else if (j.status==='failed'){ stEl.textContent='Fallo'; stEl.classList.add('bad'); stEl.classList.remove('ok'); localStorage.removeItem('restore_job'); }
-  else { stEl.textContent='En curso…'; stEl.classList.remove('ok','bad'); }
-  if(j.status==='running') setTimeout(function(){ pollRestore(jobId); },700);
-}
-
-document.addEventListener('change', function(e){ if(e.target && e.target.id==='restore_server') loadRestoreBackups(); });
-loadServers();
-</script>
-</body>
-</html>`;
-}
-
+// Export router factory
 module.exports = { createPanelRouter };
