@@ -1,29 +1,28 @@
+// login.js
 "use strict";
 
 const express = require("express");
 const session = require("express-session");
 const { authenticate } = require("./db");
 
-// ====== Config visual / marcas ======
+// ====== Marca ======
 const BRAND = {
   title: "Sistema de Backup SkyUltraPlus",
   subtitle: "by Russell xz",
   logo: "https://cdn.russellxz.click/3c8ab72a.png",
 };
 
-// ====== Crea router de login con sesión incluida ======
 function createLoginRouter(opts = {}) {
   const {
-    loginPath = "/login",
-    successRedirect = "/panel", // a dónde enviar tras logueo
-    sessionName = "sid",
-    sessionSecret = process.env.SESSION_SECRET || "skyultraplus__change_me",
-    cookieSecure = false, // pon true si usas HTTPS detrás de proxy bien configurado
+    successRedirect = "/panel",
+    sessionName = "sup.sid",
+    sessionSecret = "skyultraplus__change_me",
+    cookieSecure = false,
   } = opts;
 
   const router = express.Router();
 
-  // Sesión (aplica a todo lo montado en este router)
+  router.use(express.urlencoded({ extended: true }));
   router.use(
     session({
       name: sessionName,
@@ -32,164 +31,88 @@ function createLoginRouter(opts = {}) {
       saveUninitialized: false,
       cookie: {
         httpOnly: true,
-        sameSite: "lax",
+        sameSite: cookieSecure ? "none" : "lax",
         secure: cookieSecure,
         maxAge: 1000 * 60 * 60 * 24 * 7, // 7 días
       },
     })
   );
 
-  // Parser para POST form
-  router.use(express.urlencoded({ extended: false }));
+  // Middleware auth
+  function ensureAuth(req, res, next) {
+    if (req.session?.user) return next();
+    return res.redirect("/login");
+  }
 
-  // Si ya está logueado, saltar login
-  router.get(loginPath, (req, res) => {
+  router.get("/login", (req, res) => {
     if (req.session?.user) return res.redirect(successRedirect);
-    res.type("html").send(renderLoginPage());
+    const msg = req.query.msg ? String(req.query.msg) : "";
+    res.type("html").send(renderLogin(msg));
   });
 
-  // Procesar login
-  router.post(loginPath, (req, res) => {
-    const { email = "", password = "" } = req.body || {};
+  router.post("/login", (req, res) => {
+    const email = String(req.body.email || "").trim();
+    const password = String(req.body.password || "");
     const user = authenticate(email, password);
-    if (!user) {
-      return res
-        .status(401)
-        .type("html")
-        .send(renderLoginPage("Correo o contraseña inválidos.", email));
-    }
+    if (!user) return res.redirect("/login?msg=Credenciales%20inv%C3%A1lidas");
     req.session.user = { id: user.id, email: user.email };
-    res.redirect(successRedirect);
+    return res.redirect(successRedirect);
   });
 
-  // Logout
   router.post("/logout", (req, res) => {
-    req.session?.destroy?.(() => res.redirect(loginPath));
+    req.session.destroy(() => res.redirect("/login?msg=Sesi%C3%B3n%20cerrada"));
   });
 
-  // Util: quién soy (opcional)
-  router.get("/whoami", (req, res) => {
-    res.json({ user: req.session?.user || null });
-  });
-
-  return {
-    router,
-    ensureAuth: (req, res, next) => {
-      if (req.session?.user) return next();
-      res.redirect(loginPath);
-    },
-  };
+  return { router, ensureAuth };
 }
 
-// ====== HTML del login (tema blanco, logo, centrado) ======
-function renderLoginPage(errorMsg = "", emailPrefill = "") {
-  const esc = (s) =>
-    String(s || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-
+function renderLogin(msg = "") {
   return `<!DOCTYPE html>
 <html lang="es">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>${BRAND.title}</title>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Iniciar sesión — SkyUltraPlus</title>
 <style>
-  :root {
-    --bg: #ffffff;
-    --fg: #0f172a;
-    --muted: #64748b;
-    --primary: #111827;
-    --primary-contrast: #ffffff;
-    --ring: #e5e7eb;
-    --danger: #ef4444;
-  }
-  * { box-sizing: border-box; }
-  html,body { height:100%; }
-  body {
-    margin:0; background:var(--bg); color:var(--fg);
-    font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
-    display:flex; align-items:center; justify-content:center; padding:16px;
-  }
-  .card {
-    width:100%; max-width:420px; background:#fff; border:1px solid var(--ring);
-    border-radius:14px; box-shadow: 0 6px 24px rgba(15,23,42,.06); padding:28px;
-  }
-  .brand { text-align:center; margin-bottom:18px; }
-  .brand img { width:92px; height:auto; display:block; margin:0 auto 10px; }
-  h1 { margin:0 0 6px; font-size:22px; font-weight:700; text-align:center; }
-  .sub { text-align:center; color:var(--muted); font-size:12px; margin-bottom:22px; }
-  form { display:grid; gap:12px; }
-  label { font-size:12px; color:var(--muted); display:block; margin-bottom:6px; }
-  input {
-    width:100%; padding:12px 14px; border:1px solid var(--ring); border-radius:10px;
-    font-size:14px; outline:none; background:#fff; color:var(--fg);
-  }
-  input:focus { border-color:#cbd5e1; box-shadow:0 0 0 3px rgba(59,130,246,.12); }
-  .btn {
-    width:100%; padding:12px 14px; border:none; border-radius:10px; cursor:pointer;
-    background:var(--primary); color:var(--primary-contrast); font-weight:600; font-size:14px;
-  }
-  .btn:active { transform: translateY(1px); }
-  .err {
-    background: #fee2e2; color:#991b1b; border:1px solid #fecaca;
-    padding:10px 12px; border-radius:10px; font-size:13px; margin-bottom:6px;
-  }
-  .row { display:grid; gap:6px; }
-  .foot {
-    margin-top:16px; text-align:center; color:var(--muted); font-size:11px;
-  }
-  .toggle {
-    position:absolute; right:12px; top:50%; transform:translateY(-50%);
-    font-size:12px; color:#475569; cursor:pointer; user-select:none;
-  }
-  .input-wrap { position:relative; }
+  :root{--bg:#0b1220;--panel:#0f172a;--ring:#1f2937;--fg:#e5e7eb;--muted:#94a3b8;--accent:#2563eb}
+  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
+  .wrap{min-height:100vh;display:grid;place-items:center;padding:24px}
+  .card{width:100%;max-width:420px;background:var(--panel);border:1px solid var(--ring);border-radius:14px;box-shadow:0 6px 24px rgba(0,0,0,.35);padding:28px}
+  .brand{text-align:center;margin-bottom:18px} .brand img{width:88px;height:auto;margin:0 auto 10px;display:block}
+  h1{margin:0 0 6px;font-size:22px;font-weight:700;text-align:center}
+  .sub{text-align:center;color:var(--muted);font-size:12px;margin-bottom:22px}
+  form{display:grid;gap:12px}
+  label{font-size:12px;color:var(--muted);display:block;margin-bottom:6px}
+  input{width:100%;padding:12px 14px;border:1px solid var(--ring);border-radius:10px;background:#0b1220;color:var(--fg);outline:none}
+  input:focus{border-color:#334155}
+  button{padding:12px;border:none;border-radius:10px;background:var(--accent);color:#fff;font-weight:700;cursor:pointer}
+  .msg{margin:6px 0 0;font-size:12px;color:#fca5a5;text-align:center;min-height:18px}
 </style>
 </head>
 <body>
+<div class="wrap">
   <div class="card">
     <div class="brand">
-      <img src="${esc(BRAND.logo)}" alt="logo" />
-      <h1>${esc(BRAND.title)}</h1>
-      <div class="sub">${esc(BRAND.subtitle)}</div>
+      <img src="${BRAND.logo}" alt="logo"/>
+      <h1>${BRAND.title}</h1>
+      <div class="sub">${BRAND.subtitle}</div>
     </div>
-
-    ${errorMsg ? `<div class="err">${esc(errorMsg)}</div>` : ""}
-
-    <form method="post" action="/login" autocomplete="on">
-      <div class="row">
-        <label for="email">Correo</label>
-        <input id="email" name="email" type="email" required placeholder="tu@correo.com" value="${esc(emailPrefill)}" />
+    <form method="post" action="/login">
+      <div>
+        <label>Correo</label>
+        <input name="email" type="email" required placeholder="tu@correo.com"/>
       </div>
-
-      <div class="row">
-        <label for="password">Contraseña</label>
-        <div class="input-wrap">
-          <input id="password" name="password" type="password" required placeholder="••••••••" />
-          <span class="toggle" onclick="(function(t){const i=document.getElementById('password'); if(i.type==='password'){i.type='text'; t.textContent='Ocultar';} else {i.type='password'; t.textContent='Mostrar';}})(this)">Mostrar</span>
-        </div>
+      <div>
+        <label>Contraseña</label>
+        <input name="password" type="password" required placeholder="••••••••"/>
       </div>
-
-      <button class="btn" type="submit">Iniciar sesión</button>
+      <button>Entrar</button>
     </form>
-
-    <div class="foot">
-      Acceso exclusivo para socios de SkyUltraPlus.
-    </div>
+    <div class="msg">${msg}</div>
   </div>
+</div>
 </body>
 </html>`;
 }
 
 module.exports = { createLoginRouter };
-
-// ====== Ejemplo de uso (en tu app principal):
-// const express = require("express");
-// const { createLoginRouter } = require("./login");
-// const app = express();
-// const { router, ensureAuth } = createLoginRouter({ successRedirect: "/panel" });
-// app.use(router);
-// app.get("/panel", ensureAuth, (req,res)=> res.send("Bienvenido al panel ♡"));
-// app.listen(3000);
