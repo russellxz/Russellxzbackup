@@ -34,7 +34,7 @@ db.exec(`
   END;
 `);
 
-// --- NUEVO: Tablas para el panel Paymenter (compatibles con panel.js)
+// --- Tablas para el panel Paymenter
 db.exec(`
   CREATE TABLE IF NOT EXISTS servers (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,10 +110,8 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_restores_server_from ON restores(server_id_from);
 `);
 
-// --- Migraciones suaves (agregar columnas si faltan, sin romper datos)
-function tryAlter(sql) {
-  try { db.prepare(sql).run(); } catch {}
-}
+// --- Migraciones suaves (añaden columnas si faltan, sin romper datos)
+function tryAlter(sql) { try { db.prepare(sql).run(); } catch (_) {} }
 
 // servers
 tryAlter(`ALTER TABLE servers ADD COLUMN pmtr_path     TEXT NOT NULL DEFAULT '/var/www/paymenter'`);
@@ -132,17 +130,15 @@ tryAlter(`ALTER TABLE restores ADD COLUMN target_server_id INTEGER`);
 tryAlter(`ALTER TABLE restores ADD COLUMN preserve_auth INTEGER NOT NULL DEFAULT 1`);
 tryAlter(`ALTER TABLE restores ADD COLUMN note TEXT`);
 
-// --- Seed: SOLO si la tabla está VACÍA (no cambia tus credenciales existentes)
+// --- Seed: SOLO si la tabla está vacía (no toca tus credenciales existentes)
 const DEFAULT_EMAIL = "yemilpty1998@gmail.com";
 const DEFAULT_PASS = "Flowpty1998@";
 (function seedDefaultAdmin() {
   const total = db.prepare("SELECT COUNT(*) AS c FROM users").get().c || 0;
-  if (total > 0) return; // ya hay usuarios: NO tocamos nada
+  if (total > 0) return;
   const hash = bcrypt.hashSync(DEFAULT_PASS, 12);
-  db.prepare(`
-    INSERT INTO users (email, password_hash, is_active)
-    VALUES (?, ?, 1)
-  `).run(DEFAULT_EMAIL, hash);
+  db.prepare(`INSERT INTO users (email, password_hash, is_active) VALUES (?, ?, 1)`)
+    .run(DEFAULT_EMAIL, hash);
 })();
 
 // --- Helpers
@@ -156,9 +152,10 @@ function toUser(row) {
   } : null;
 }
 
-// --- API de usuarios (sin cambios de comportamiento sobre cuentas existentes)
+// --- API usuarios
 function authenticate(email, password) {
-  const row = db.prepare("SELECT * FROM users WHERE email = ? AND is_active = 1").get(String(email || "").trim());
+  const row = db.prepare("SELECT * FROM users WHERE email = ? AND is_active = 1")
+    .get(String(email || "").trim());
   if (!row) return null;
   const ok = bcrypt.compareSync(String(password || ""), row.password_hash);
   return ok ? toUser(row) : null;
@@ -174,10 +171,7 @@ function createUser(email, password, { active = true } = {}) {
   const pw = String(password || "");
   if (!em || !pw) throw new Error("email y password son requeridos");
   const hash = bcrypt.hashSync(pw, 12);
-  const stmt = db.prepare(`
-    INSERT INTO users (email, password_hash, is_active)
-    VALUES (?, ?, ?)
-  `);
+  const stmt = db.prepare(`INSERT INTO users (email, password_hash, is_active) VALUES (?, ?, ?)`);
   try {
     const info = stmt.run(em, hash, active ? 1 : 0);
     return getUserById(info.lastInsertRowid);
@@ -195,7 +189,8 @@ function getUserById(id) {
 }
 
 function getUserByEmail(email) {
-  const row = db.prepare("SELECT id, email, is_active, created_at, updated_at FROM users WHERE email = ?").get(String(email || "").trim());
+  const row = db.prepare("SELECT id, email, is_active, created_at, updated_at FROM users WHERE email = ?")
+    .get(String(email || "").trim());
   return toUser(row);
 }
 
