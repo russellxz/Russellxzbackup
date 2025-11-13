@@ -1,3 +1,4 @@
+// db.js — actualizado para Paymenter (servers/backups/restores) SIN cambiar credenciales existentes
 "use strict";
 
 const fs = require("fs");
@@ -11,11 +12,12 @@ if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const db = new Database(DB_PATH, { fileMustExist: false });
 
-// --- Schema
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
+// --- PRAGMA / modo WAL
+db.pragma("journal_mode = WAL");
+db.pragma("foreign_keys = ON");
 
+// --- Schema base (users)
+db.exec(`
   CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     email         TEXT NOT NULL UNIQUE,
@@ -32,19 +34,115 @@ db.exec(`
   END;
 `);
 
-// --- Seed: admin por defecto
+// --- NUEVO: Tablas para el panel Paymenter (compatibles con panel.js)
+db.exec(`
+  CREATE TABLE IF NOT EXISTS servers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    label           TEXT,
+    ip              TEXT NOT NULL,
+    ssh_user        TEXT NOT NULL DEFAULT 'root',
+    ssh_pass        TEXT NOT NULL,
+
+    pmtr_path       TEXT NOT NULL DEFAULT '/var/www/paymenter',
+    db_host         TEXT NOT NULL DEFAULT '127.0.0.1',
+    db_name         TEXT NOT NULL DEFAULT 'paymenter',
+    db_user         TEXT NOT NULL DEFAULT 'paymenter',
+    db_pass         TEXT NOT NULL DEFAULT '',
+
+    schedule_key    TEXT NOT NULL DEFAULT 'off',
+    interval_ms     INTEGER NOT NULL DEFAULT 0,
+    enabled         INTEGER NOT NULL DEFAULT 0,
+
+    retention_key   TEXT NOT NULL DEFAULT 'off',
+    retention_ms    INTEGER NOT NULL DEFAULT 0,
+
+    last_run        TEXT,
+    next_run        TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TRIGGER IF NOT EXISTS trg_servers_updated_at
+  AFTER UPDATE ON servers
+  FOR EACH ROW BEGIN
+    UPDATE servers SET updated_at = datetime('now') WHERE id = OLD.id;
+  END;
+
+  CREATE TABLE IF NOT EXISTS backups (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    server_id   INTEGER NOT NULL,
+    filename    TEXT NOT NULL,
+    size_bytes  INTEGER,
+    status      TEXT NOT NULL DEFAULT 'running', -- running|done|failed
+    type        TEXT NOT NULL DEFAULT 'full',    -- full|db
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY(server_id) REFERENCES servers(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS restores (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    backup_id         INTEGER NOT NULL,
+    server_id_from    INTEGER NOT NULL,
+    mode              TEXT NOT NULL,  -- same|other
+    target_ip         TEXT,
+    target_user       TEXT,
+    target_server_id  INTEGER,
+    preserve_auth     INTEGER NOT NULL DEFAULT 1,
+    note              TEXT,
+    status            TEXT NOT NULL DEFAULT 'running', -- running|done|failed
+    created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY(backup_id)      REFERENCES backups(id) ON DELETE CASCADE,
+    FOREIGN KEY(server_id_from) REFERENCES servers(id) ON DELETE CASCADE
+  );
+
+  CREATE TRIGGER IF NOT EXISTS trg_restores_updated_at
+  AFTER UPDATE ON restores
+  FOR EACH ROW BEGIN
+    UPDATE restores SET updated_at = datetime('now') WHERE id = OLD.id;
+  END;
+`);
+
+// --- Índices útiles
+db.exec(`
+  CREATE INDEX IF NOT EXISTS idx_backups_server_id ON backups(server_id);
+  CREATE INDEX IF NOT EXISTS idx_restores_backup_id ON restores(backup_id);
+  CREATE INDEX IF NOT EXISTS idx_restores_server_from ON restores(server_id_from);
+`);
+
+// --- Migraciones suaves (agregar columnas si faltan, sin romper datos)
+function tryAlter(sql) {
+  try { db.prepare(sql).run(); } catch {}
+}
+
+// servers
+tryAlter(`ALTER TABLE servers ADD COLUMN pmtr_path     TEXT NOT NULL DEFAULT '/var/www/paymenter'`);
+tryAlter(`ALTER TABLE servers ADD COLUMN db_host       TEXT NOT NULL DEFAULT '127.0.0.1'`);
+tryAlter(`ALTER TABLE servers ADD COLUMN db_name       TEXT NOT NULL DEFAULT 'paymenter'`);
+tryAlter(`ALTER TABLE servers ADD COLUMN db_user       TEXT NOT NULL DEFAULT 'paymenter'`);
+tryAlter(`ALTER TABLE servers ADD COLUMN db_pass       TEXT NOT NULL DEFAULT ''`);
+tryAlter(`ALTER TABLE servers ADD COLUMN retention_key TEXT NOT NULL DEFAULT 'off'`);
+tryAlter(`ALTER TABLE servers ADD COLUMN retention_ms  INTEGER NOT NULL DEFAULT 0`);
+
+// backups
+tryAlter(`ALTER TABLE backups ADD COLUMN type TEXT NOT NULL DEFAULT 'full'`);
+
+// restores
+tryAlter(`ALTER TABLE restores ADD COLUMN target_server_id INTEGER`);
+tryAlter(`ALTER TABLE restores ADD COLUMN preserve_auth INTEGER NOT NULL DEFAULT 1`);
+tryAlter(`ALTER TABLE restores ADD COLUMN note TEXT`);
+
+// --- Seed: SOLO si la tabla está VACÍA (no cambia tus credenciales existentes)
 const DEFAULT_EMAIL = "yemilpty1998@gmail.com";
 const DEFAULT_PASS = "Flowpty1998@";
-
 (function seedDefaultAdmin() {
-  const exists = db.prepare("SELECT id FROM users WHERE email = ?").get(DEFAULT_EMAIL);
-  if (!exists) {
-    const hash = bcrypt.hashSync(DEFAULT_PASS, 12);
-    db.prepare(`
-      INSERT INTO users (email, password_hash, is_active)
-      VALUES (?, ?, 1)
-    `).run(DEFAULT_EMAIL, hash);
-  }
+  const total = db.prepare("SELECT COUNT(*) AS c FROM users").get().c || 0;
+  if (total > 0) return; // ya hay usuarios: NO tocamos nada
+  const hash = bcrypt.hashSync(DEFAULT_PASS, 12);
+  db.prepare(`
+    INSERT INTO users (email, password_hash, is_active)
+    VALUES (?, ?, 1)
+  `).run(DEFAULT_EMAIL, hash);
 })();
 
 // --- Helpers
@@ -58,7 +156,7 @@ function toUser(row) {
   } : null;
 }
 
-// --- API
+// --- API de usuarios (sin cambios de comportamiento sobre cuentas existentes)
 function authenticate(email, password) {
   const row = db.prepare("SELECT * FROM users WHERE email = ? AND is_active = 1").get(String(email || "").trim());
   if (!row) return null;
@@ -123,7 +221,7 @@ function updateUser(id, { email, password, active } = {}) {
 
   if (!updates.length) return getUserById(id);
 
-  const sql = `UPDATE users SET ${updates.join(", ")} WHERE id = ?`;
+  const sql = `UPDATE users SET ${updates.join(", ")}, updated_at = datetime('now') WHERE id = ?`;
   params.push(id);
 
   try {
