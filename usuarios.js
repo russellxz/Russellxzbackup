@@ -75,6 +75,21 @@ function createUsersRouter({ ensureAuth } = {}) {
       });
     });
   }
+  // RAM del sistema
+  function getMemStats() {
+    const total = os.totalmem();
+    const free  = os.freemem();
+    const used  = Math.max(0, total - free);
+    const usedPct = total > 0 ? (used / total) * 100 : 0;
+    return {
+      totalBytes: total,
+      freeBytes: free,
+      usedBytes: used,
+      usedPct,
+      totalHuman: formatBytes(total),
+      freeHuman: formatBytes(free),
+    };
+  }
 
   router.get("/api/monitor/events", async (req, res) => {
     const path = (typeof req.query.path === "string" && req.query.path.trim()) ? req.query.path.trim() : "/";
@@ -94,13 +109,17 @@ function createUsersRouter({ ensureAuth } = {}) {
         const next = snapshotCpuTimes();
         const cpuPct = Math.max(0, Math.min(100, cpuUsagePercent(prev, next) || 0));
         prev = next;
-        const disk = await getDiskStats(path).catch(() => null);
+        const [disk, mem] = await Promise.all([
+          getDiskStats(path).catch(() => null),
+          Promise.resolve(getMemStats()),
+        ]);
         const payload = {
           now: new Date().toLocaleString(),
           cpuPct,
           cores: next.cores,
           loadAvg: (os.loadavg() || []).map((n) => (n || 0).toFixed(2)),
           disk,
+          mem,
         };
         res.write(`data: ${JSON.stringify(payload)}\n\n`);
       } catch (_) {
@@ -223,7 +242,7 @@ function renderUsersPage() {
 <main>
   <!-- Consola embebida -->
   <section class="card">
-    <h2 style="margin:0 0 10px;font-size:16px">Consola — CPU y Disco (tiempo real)</h2>
+    <h2 style="margin:0 0 10px;font-size:16px">Consola — CPU, RAM y Disco (tiempo real)</h2>
     <div class="grid cols-2">
       <div class="row">
         <label>Ruta de disco a monitorear</label>
@@ -244,6 +263,18 @@ function renderUsersPage() {
       <div class="kpi">
         <div><span class="pill" id="cores">Cores: -</span></div>
         <div><span class="pill" id="load">Load avg: -</span></div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <div class="metric">
+        <div style="width:110px">RAM usada</div>
+        <div class="bar"><span id="ramBar" style="width:0%"></span></div>
+        <div id="ramUsed" style="width:70px;text-align:right">0%</div>
+      </div>
+      <div class="kpi">
+        <div><span class="pill" id="ramTotal">Total: -</span></div>
+        <div><span class="pill" id="ramFree">Libre: -</span></div>
       </div>
     </div>
 
@@ -314,6 +345,15 @@ function connectConsole(path){
       document.getElementById("cores").textContent = "Cores: " + (j.cores ?? "-");
       document.getElementById("load").textContent  = "Load avg: " + (j.loadAvg || []).join(", ");
 
+      // RAM
+      if (j.mem) {
+        const rused = Math.max(0, Math.min(100, j.mem.usedPct || 0));
+        document.getElementById("ramBar").style.width = rused.toFixed(1) + "%";
+        document.getElementById("ramUsed").textContent = rused.toFixed(1) + "%";
+        document.getElementById("ramTotal").textContent = "Total: " + (j.mem.totalHuman || "-");
+        document.getElementById("ramFree").textContent  = "Libre: " + (j.mem.freeHuman || "-");
+      }
+
       // Disco
       if (j.disk) {
         const used = Math.max(0, Math.min(100, j.disk.usedPct || 0));
@@ -327,7 +367,8 @@ function connectConsole(path){
   };
   es.onerror = ()=>{ /* SSE reintenta solo */ };
 }
-document.getElementById("btnApply").addEventListener("click", ()=>{
+document.getElementById("btnApply").addEventListener("click", (e)=>{
+  e.preventDefault();
   const p = document.getElementById("diskPath").value || "/";
   connectConsole(p);
 });
