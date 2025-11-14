@@ -13,7 +13,12 @@ function createUsersRouter({ ensureAuth } = {}) {
 
   // ====== Métricas
   const KB = 1024, MB = KB * 1024, GB = MB * 1024, TB = GB * 1024;
-  const fmtB = (b) => (b>=TB? (b/TB).toFixed(2)+" TB" : b>=GB? (b/GB).toFixed(2)+" GB" : b>=MB? (b/MB).toFixed(2)+" MB" : b>=KB? (b/KB).toFixed(2)+" KB" : b+" B");
+  const fmtB = (b) =>
+    b >= TB ? (b / TB).toFixed(2) + " TB" :
+    b >= GB ? (b / GB).toFixed(2) + " GB" :
+    b >= MB ? (b / MB).toFixed(2) + " MB" :
+    b >= KB ? (b / KB).toFixed(2) + " KB" :
+    b + " B";
 
   const snapshotCpu = () => {
     const cpus = os.cpus() || [];
@@ -40,14 +45,14 @@ function createUsersRouter({ ensureAuth } = {}) {
         if (lines.length < 2) return reject(new Error("df vacío"));
         const parts = lines[1].trim().split(/\s+/);
         const blocksK = parseInt(parts[1], 10) || 0;
-        const usedK = parseInt(parts[2], 10) || 0;
-        const availK = parseInt(parts[3], 10) || 0;
+        const usedK   = parseInt(parts[2], 10) || 0;
+        const availK  = parseInt(parts[3], 10) || 0;
         const capText = parts[4];
-        const mount = parts[5];
-        const total = blocksK * 1024;
-        const used = usedK * 1024;
-        const avail = availK * 1024;
-        let usedPct = Number(String(capText).replace("%", ""));
+        const mount   = parts[5];
+        const total   = blocksK * 1024;
+        const used    = usedK * 1024;
+        const avail   = availK * 1024;
+        let usedPct   = Number(String(capText).replace("%", ""));
         if (!Number.isFinite(usedPct)) usedPct = total ? (used / total) * 100 : 0;
         resolve({
           filesystem: parts[0],
@@ -63,9 +68,11 @@ function createUsersRouter({ ensureAuth } = {}) {
       });
     });
 
-  // ====== SSE
+  // ====== SSE (CPU/RAM/DISCO en tiempo real)
   router.get("/api/monitor/events", async (req, res) => {
-    const path = (typeof req.query.path === "string" && req.query.path.trim()) ? req.query.path.trim() : "/";
+    const path = (typeof req.query.path === "string" && req.query.path.trim())
+      ? req.query.path.trim()
+      : "/";
     const intervalMs = Math.max(300, parseInt(req.query.ms || "1000", 10));
 
     res.writeHead(200, {
@@ -85,8 +92,8 @@ function createUsersRouter({ ensureAuth } = {}) {
 
         // RAM
         const total = os.totalmem();
-        const free = os.freemem();
-        const used = total - free;
+        const free  = os.freemem();
+        const used  = total - free;
         const ramPct = total ? (used / total) * 100 : 0;
 
         const disk = await getDisk(path).catch(() => null);
@@ -128,7 +135,9 @@ function createUsersRouter({ ensureAuth } = {}) {
   router.post("/api/users", (req, res) => {
     const { email = "", password = "", active = true } = req.body || {};
     try {
-      if (!email || !password) return res.status(400).json({ error: "email y password son requeridos" });
+      if (!email || !password) {
+        return res.status(400).json({ error: "email y password son requeridos" });
+      }
       const u = createUser(String(email).trim(), String(password), { active: !!active });
       res.json({ user: u });
     } catch (e) {
@@ -172,20 +181,93 @@ function renderPage() {
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Usuarios — SkyUltraPlus</title>
 <style>
-  :root{--bg:#ffffff;--fg:#0f172a;--muted:#64748b;--ring:#e5e7eb;--primary:#111827;--accent:#2563eb}
-  *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
-  header{display:flex;align-items:center;gap:12px;padding:14px 18px;border-bottom:1px solid var(--ring)}
+  :root{
+    --bg:#ffffff;
+    --fg:#0f172a;
+    --muted:#64748b;
+    --ring:#e5e7eb;
+    --primary:#111827;
+    --accent:#2563eb
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0;
+    background:var(--bg);
+    color:var(--fg);
+    font-family:ui-sans-serif,system-ui,Segoe UI,Roboto,Arial
+  }
+  header{
+    display:flex;
+    align-items:center;
+    gap:12px;
+    padding:14px 18px;
+    border-bottom:1px solid var(--ring)
+  }
   header img{width:40px;height:40px}
-  h1{font-size:18px;margin:0}.sub{font-size:12px;color:var(--muted)}
-  main{max-width:1000px;margin:0 auto;padding:20px;display:grid;gap:18px}
-  .card{border:1px solid var(--ring);border-radius:12px;padding:16px}
-  .row{display:grid;gap:10px}.grid{display:grid;gap:12px}.grid.cols-2{grid-template-columns:1fr 1fr}
-  label{font-size:12px;color:var(--muted)} input,select{width:100%;padding:10px 12px;border:1px solid var(--ring);border-radius:10px;font-size:14px}
-  button{padding:10px 12px;border:none;border-radius:10px;background:var(--primary);color:#fff;font-weight:600;cursor:pointer}
-  button.secondary{background:#334155} table{width:100%;border-collapse:collapse} th,td{padding:10px;border-bottom:1px solid var(--ring);text-align:left;font-size:14px}
-  .metric{display:flex;align-items:center;gap:12px}.bar{flex:1;height:10px;background:#f1f5f9;border-radius:999px;overflow:hidden;border:1px solid var(--ring)}
-  .bar>span{display:block;height:100%;background:linear-gradient(90deg,#60a5fa,#2563eb)}
-  .pill{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--ring);color:#334155}
+  h1{font-size:18px;margin:0}
+  .sub{font-size:12px;color:var(--muted)}
+  main{
+    max-width:1000px;
+    margin:0 auto;
+    padding:20px;
+    display:grid;
+    gap:18px
+  }
+  .card{
+    border:1px solid var(--ring);
+    border-radius:12px;
+    padding:16px
+  }
+  .row{display:grid;gap:10px}
+  .grid{display:grid;gap:12px}
+  .grid.cols-2{grid-template-columns:1fr 1fr}
+  label{font-size:12px;color:var(--muted)}
+  input,select{
+    width:100%;
+    padding:10px 12px;
+    border:1px solid var(--ring);
+    border-radius:10px;
+    font-size:14px
+  }
+  button{
+    padding:10px 12px;
+    border:none;
+    border-radius:10px;
+    background:var(--primary);
+    color:#fff;
+    font-weight:600;
+    cursor:pointer
+  }
+  button.secondary{background:#334155}
+  table{width:100%;border-collapse:collapse}
+  th,td{
+    padding:10px;
+    border-bottom:1px solid var(--ring);
+    text-align:left;
+    font-size:14px
+  }
+  .metric{display:flex;align-items:center;gap:12px}
+  .bar{
+    flex:1;
+    height:10px;
+    background:#f1f5f9;
+    border-radius:999px;
+    overflow:hidden;
+    border:1px solid var(--ring)
+  }
+  .bar>span{
+    display:block;
+    height:100%;
+    background:linear-gradient(90deg,#60a5fa,#2563eb)
+  }
+  .pill{
+    display:inline-block;
+    padding:2px 8px;
+    border-radius:999px;
+    font-size:12px;
+    border:1px solid var(--ring);
+    color:#334155
+  }
 </style>
 </head>
 <body>
@@ -197,7 +279,9 @@ function renderPage() {
   </div>
   <div style="flex:1"></div>
   <a href="/panel"><button class="secondary">Volver al Panel</button></a>
-  <form method="post" action="/logout" style="margin-left:8px"><button class="secondary">Salir</button></form>
+  <form method="post" action="/logout" style="margin-left:8px">
+    <button class="secondary">Salir</button>
+  </form>
 </header>
 
 <main>
@@ -209,7 +293,9 @@ function renderPage() {
         <label>Ruta de disco a monitorear</label>
         <input id="diskPath" value="/" placeholder="/"/>
       </div>
-      <div class="row" style="align-self:end"><button id="btnApply">Aplicar</button></div>
+      <div class="row" style="align-self:end">
+        <button id="btnApply">Aplicar</button>
+      </div>
     </div>
     <div class="row" style="margin-top:12px">
       <div class="metric">
@@ -217,7 +303,10 @@ function renderPage() {
         <div class="bar"><span id="cpuBar" style="width:0%"></span></div>
         <div id="cpuPct" style="width:70px;text-align:right">0%</div>
       </div>
-      <div><span class="pill" id="cores">Cores: -</span> <span class="pill" id="load">Load: -</span></div>
+      <div>
+        <span class="pill" id="cores">Cores: -</span>
+        <span class="pill" id="load">Load: -</span>
+      </div>
     </div>
     <div class="row" style="margin-top:8px">
       <div class="metric">
@@ -232,7 +321,11 @@ function renderPage() {
         <div class="bar"><span id="diskBar" style="width:0%"></span></div>
         <div id="diskUsed" style="width:70px;text-align:right">0%</div>
       </div>
-      <div><span class="pill" id="diskTotal">Total: -</span> <span class="pill" id="diskFree">Libre: -</span> <span class="pill" id="mountInfo">—</span></div>
+      <div>
+        <span class="pill" id="diskTotal">Total: -</span>
+        <span class="pill" id="diskFree">Libre: -</span>
+        <span class="pill" id="mountInfo">—</span>
+      </div>
     </div>
   </section>
 
@@ -240,10 +333,24 @@ function renderPage() {
   <section class="card">
     <h2 style="margin:0 0 10px;font-size:16px">Crear usuario</h2>
     <div class="grid cols-2">
-      <div class="row"><label>Correo</label><input id="new_email" type="email" placeholder="nuevo@correo.com"/></div>
-      <div class="row"><label>Contraseña</label><input id="new_password" type="password" placeholder="••••••••"/></div>
-      <div class="row"><label>Activo</label><select id="new_active"><option value="true">Sí</option><option value="false">No</option></select></div>
-      <div class="row" style="align-self:end"><button onclick="createUser()">Crear</button></div>
+      <div class="row">
+        <label>Correo</label>
+        <input id="new_email" type="email" placeholder="nuevo@correo.com"/>
+      </div>
+      <div class="row">
+        <label>Contraseña</label>
+        <input id="new_password" type="password" placeholder="••••••••"/>
+      </div>
+      <div class="row">
+        <label>Activo</label>
+        <select id="new_active">
+          <option value="true">Sí</option>
+          <option value="false">No</option>
+        </select>
+      </div>
+      <div class="row" style="align-self:end">
+        <button onclick="createUser()">Crear</button>
+      </div>
     </div>
     <div class="sub">Todos los usuarios tienen permisos administrativos.</div>
   </section>
@@ -260,6 +367,7 @@ function renderPage() {
 
 <script>
 let es = null;
+
 function connectConsole(path){
   if (es) es.close();
   const url = new URL(window.location.origin + '/api/monitor/events');
@@ -272,13 +380,14 @@ function connectConsole(path){
       const c = Math.max(0, Math.min(100, j.cpuPct || 0));
       document.getElementById("cpuBar").style.width = c.toFixed(1) + "%";
       document.getElementById("cpuPct").textContent = c.toFixed(1) + "%";
-      document.getElementById("cores").textContent = "Cores: " + (j.cores ?? "-");
-      document.getElementById("load").textContent  = "Load: " + (j.loadAvg || []).join(", ");
+      document.getElementById("cores").textContent  = "Cores: " + (j.cores ?? "-");
+      document.getElementById("load").textContent   = "Load: " + (j.loadAvg || []).join(", ");
       // RAM
       if (j.ram) {
         const rp = Math.max(0, Math.min(100, j.ram.usedPct || 0));
         document.getElementById("ramBar").style.width = rp.toFixed(1) + "%";
-        document.getElementById("ramUsed").textContent = rp.toFixed(1) + "% (" + j.ram.usedHuman + " / " + j.ram.totalHuman + ")";
+        document.getElementById("ramUsed").textContent =
+          rp.toFixed(1) + "% (" + j.ram.usedHuman + " / " + j.ram.totalHuman + ")";
       }
       // Disco
       if (j.disk) {
@@ -286,27 +395,35 @@ function connectConsole(path){
         document.getElementById("diskBar").style.width = used.toFixed(1) + "%";
         document.getElementById("diskUsed").textContent = used.toFixed(1) + "%";
         document.getElementById("diskTotal").textContent = "Total: " + (j.disk.totalHuman || "-");
-        document.getElementById("diskFree").textContent  = "Libre: " + (j.disk.availHuman || "-") + " (" + (j.disk.freePct||0).toFixed(1) + "%)";
-        document.getElementById("mountInfo").textContent = "Montaje: " + (j.disk.mount || "—") + " | FS: " + (j.disk.filesystem || "—");
+        document.getElementById("diskFree").textContent  =
+          "Libre: " + (j.disk.availHuman || "-") + " (" + (j.disk.freePct || 0).toFixed(1) + "%)";
+        document.getElementById("mountInfo").textContent =
+          "Montaje: " + (j.disk.mount || "—") + " | FS: " + (j.disk.filesystem || "—");
       }
     } catch {}
   };
   es.onerror = ()=>{};
 }
+
 document.getElementById("btnApply").addEventListener("click", ()=>{
   connectConsole(document.getElementById("diskPath").value || "/");
 });
+
 window.addEventListener("load", ()=>{
   connectConsole(document.getElementById("diskPath").value || "/");
 });
 
 async function loadUsers(){
-  const r = await fetch('/api/users'); const j = await r.json();
+  const r = await fetch('/api/users');
+  const j = await r.json();
   const list = j.users || [];
   const wrap = document.getElementById('users_wrap');
-  if (!list.length){ wrap.innerHTML = '<div class="sub">Sin usuarios.</div>'; return; }
+  if (!list.length){
+    wrap.innerHTML = '<div class="sub">Sin usuarios.</div>';
+    return;
+  }
   let html = '<table><thead><tr><th>ID</th><th>Correo</th><th>Activo</th><th>Creado</th><th>Actualizado</th><th>Acciones</th></tr></thead><tbody>';
-  html += list.map(u=>\`
+  html += list.map(u => \`
     <tr>
       <td>\${u.id}</td>
       <td><input id="email_\${u.id}" value="\${u.email}" style="width:100%"/></td>
@@ -327,35 +444,75 @@ async function loadUsers(){
   html += '</tbody></table>';
   wrap.innerHTML = html;
 }
+
 async function createUser(){
   const email = document.getElementById('new_email').value.trim();
   const password = document.getElementById('new_password').value;
   const active = document.getElementById('new_active').value === 'true';
-  if (!email || !password){ alert('Correo y contraseña son requeridos'); return; }
-  const r = await fetch('/api/users', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, password, active }) });
+  if (!email || !password){
+    alert('Correo y contraseña son requeridos');
+    return;
+  }
+  const r = await fetch('/api/users', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email, password, active })
+  });
   const j = await r.json();
-  if (!r.ok){ alert(j.error || 'Error al crear usuario'); return; }
-  document.getElementById('new_email').value=''; document.getElementById('new_password').value=''; document.getElementById('new_active').value='true';
+  if (!r.ok){
+    alert(j.error || 'Error al crear usuario');
+    return;
+  }
+  document.getElementById('new_email').value='';
+  document.getElementById('new_password').value='';
+  document.getElementById('new_active').value='true';
   loadUsers();
 }
+
 async function save(id){
-  const email = document.getElementById('email_'+id).value.trim();
+  const email  = document.getElementById('email_'+id).value.trim();
   const active = document.getElementById('active_'+id).value === 'true';
-  const r = await fetch('/api/users/'+id, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ email, active }) });
-  const j = await r.json(); if (!r.ok){ alert(j.error || 'Error al guardar'); return; } loadUsers();
+  const r = await fetch('/api/users/'+id, {
+    method:'PUT',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email, active })
+  });
+  const j = await r.json();
+  if (!r.ok){
+    alert(j.error || 'Error al guardar');
+    return;
+  }
+  loadUsers();
 }
+
 async function resetPass(id){
-  const pw = prompt('Nueva contraseña:'); if (!pw) return;
-  const r = await fetch('/api/users/'+id, { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ password: pw }) });
-  const j = await r.json(); if (!r.ok){ alert(j.error || 'Error al cambiar contraseña'); return; }
-  alert('Contraseña actualizada'); loadUsers();
+  const pw = prompt('Nueva contraseña:');
+  if (!pw) return;
+  const r = await fetch('/api/users/'+id, {
+    method:'PUT',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ password: pw })
+  });
+  const j = await r.json();
+  if (!r.ok){
+    alert(j.error || 'Error al cambiar contraseña');
+    return;
+  }
+  alert('Contraseña actualizada');
+  loadUsers();
 }
+
 async function delUser(id){
   if (!confirm('¿Eliminar este usuario?')) return;
   const r = await fetch('/api/users/'+id, { method:'DELETE' });
-  const j = await r.json(); if (!r.ok){ alert(j.error || 'No se pudo eliminar'); return; }
+  const j = await r.json();
+  if (!r.ok){
+    alert(j.error || 'No se pudo eliminar');
+    return;
+  }
   loadUsers();
 }
+
 loadUsers();
 </script>
 </body>
