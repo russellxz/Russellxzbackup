@@ -129,12 +129,6 @@ function renderLogin(msg = "") {
     text-align:center;
     color:var(--muted);
     font-size:12px;
-    margin-bottom:8px;
-  }
-  .hint{
-    text-align:center;
-    color:#a5b4fc;
-    font-size:11px;
     margin-bottom:16px;
   }
   form{
@@ -190,10 +184,6 @@ function renderLogin(msg = "") {
       <img src="${BRAND.logo}" alt="logo"/>
       <h1>${BRAND.title}</h1>
       <div class="sub">${BRAND.subtitle}</div>
-      <div class="hint">
-        Usuario por defecto:<br/>
-        <strong>yemilpty1998@gmail.com</strong> · <strong>Flowpty1998@</strong>
-      </div>
     </div>
     <form method="post" action="/login">
       <div>
