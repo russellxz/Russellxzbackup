@@ -1239,3 +1239,1019 @@ function createPanelRouter({ ensureAuth } = {}) {
 
   return router;
 }
+// ===== UI HTML (panel web) =====
+function renderPanelPage() {
+  return `<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Backup Paymenter — SkyUltraPlus</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    background:#0f172a;
+    color:#e5e7eb;
+  }
+  .layout{
+    display:flex;
+    min-height:100vh;
+  }
+  .sidebar{
+    width:320px;
+    max-width:100%;
+    background:#020617;
+    border-right:1px solid #1f2937;
+    padding:12px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  .main{
+    flex:1;
+    padding:12px;
+    display:flex;
+    flex-direction:column;
+    gap:10px;
+  }
+  h1{
+    font-size:18px;
+    margin-bottom:6px;
+  }
+  h2{
+    font-size:14px;
+    margin-bottom:4px;
+  }
+  .card{
+    background:#020617;
+    border:1px solid #111827;
+    border-radius:10px;
+    padding:10px;
+  }
+  .label-small{
+    font-size:11px;
+    color:#9ca3af;
+  }
+  .form-grid{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:6px 8px;
+  }
+  .field{
+    display:flex;
+    flex-direction:column;
+    gap:3px;
+  }
+  .field input,.field select{
+    background:#020617;
+    border:1px solid #1f2937;
+    border-radius:8px;
+    padding:6px 7px;
+    font-size:12px;
+    color:#e5e7eb;
+    outline:none;
+  }
+  .field input::placeholder{color:#6b7280}
+  .field small{
+    font-size:10px;
+    color:#9ca3af;
+  }
+  .field input:focus,.field select:focus{
+    border-color:#38bdf8;
+  }
+  .btn{
+    border-radius:999px;
+    border:1px solid #4b5563;
+    background:#111827;
+    color:#e5e7eb;
+    padding:5px 10px;
+    font-size:11px;
+    cursor:pointer;
+    display:inline-flex;
+    align-items:center;
+    gap:4px;
+  }
+  .btn-primary{
+    border-color:#22c55e;
+    background:#065f46;
+  }
+  .btn-danger{
+    border-color:#f97373;
+    background:#7f1d1d;
+  }
+  .btn-sm{
+    padding:4px 8px;
+    font-size:10px;
+  }
+  .servers-list{
+    max-height:260px;
+    overflow-y:auto;
+    margin-top:4px;
+  }
+  .srv-item{
+    border-radius:8px;
+    padding:6px 8px;
+    margin-bottom:4px;
+    border:1px solid transparent;
+    cursor:pointer;
+    font-size:12px;
+  }
+  .srv-item:hover{
+    background:#020617;
+    border-color:#1f2937;
+  }
+  .srv-item.active{
+    border-color:#38bdf8;
+    background:#020617;
+  }
+  .srv-ip{
+    font-size:11px;
+    color:#9ca3af;
+  }
+  .badge{
+    display:inline-block;
+    border-radius:999px;
+    padding:1px 7px;
+    font-size:10px;
+    border:1px solid #4b5563;
+    color:#9ca3af;
+    margin-left:4px;
+  }
+  .badge.green{
+    border-color:#22c55e;
+    color:#22c55e;
+  }
+  .badge.red{
+    border-color:#f97373;
+    color:#f97373;
+  }
+  .grid-main{
+    display:grid;
+    grid-template-columns:1.1fr 1.2fr;
+    gap:10px;
+    height:calc(100vh - 24px);
+  }
+  .scroll{
+    overflow-y:auto;
+  }
+  .kv{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:6px 10px;
+    font-size:12px;
+  }
+  .kv-label{
+    font-size:11px;
+    color:#9ca3af;
+  }
+  .kv-val{
+    font-size:12px;
+    word-break:break-all;
+  }
+  table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:11px;
+  }
+  th,td{
+    padding:6px 5px;
+    border-bottom:1px solid #111827;
+    text-align:left;
+  }
+  th{
+    color:#9ca3af;
+    text-transform:uppercase;
+    font-weight:500;
+    letter-spacing:.06em;
+  }
+  tr:hover{
+    background:#020617;
+  }
+  .toast{
+    position:fixed;
+    right:12px;
+    bottom:12px;
+    background:#020617;
+    border:1px solid #4b5563;
+    border-radius:10px;
+    padding:8px 10px;
+    font-size:12px;
+    display:none;
+    max-width:320px;
+    z-index:50;
+  }
+  .jobbar{
+    position:fixed;
+    left:50%;
+    bottom:8px;
+    transform:translateX(-50%);
+    background:#020617;
+    border:1px solid #38bdf8;
+    border-radius:999px;
+    padding:6px 12px;
+    font-size:11px;
+    display:none;
+    align-items:center;
+    gap:8px;
+    max-width:420px;
+    z-index:40;
+  }
+  .jobbar-line{
+    flex:1;
+    height:5px;
+    border-radius:999px;
+    background:#111827;
+    overflow:hidden;
+  }
+  .jobbar-progress{
+    height:100%;
+    width:0;
+    background:#22c55e;
+    transition:width .2s;
+  }
+  @media (max-width:900px){
+    .layout{flex-direction:column;}
+    .grid-main{grid-template-columns:1fr;height:auto;}
+    .servers-list{max-height:180px;}
+  }
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <aside class="sidebar">
+    <div class="card">
+      <h2>Nuevo servidor Paymenter</h2>
+      <p class="label-small" style="margin-bottom:6px;">
+        Aquí registras la VPS donde está instalado Paymenter para poder hacer backups por SSH.
+      </p>
+      <form id="form-new-server">
+        <div class="form-grid">
+          <div class="field">
+            <label class="label-small">Nombre interno</label>
+            <input name="label" placeholder="Ej: Paymenter Principal"/>
+            <small>Solo para identificarlo en la lista.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">IP / Host</label>
+            <input name="ip" placeholder="127.0.0.1 o 45.x.x.x" required/>
+            <small>Dirección de la VPS donde corre Paymenter.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">Usuario SSH</label>
+            <input name="ssh_user" value="root" placeholder="root"/>
+            <small>Usuario con permisos para hacer backup (normalmente root).</small>
+          </div>
+          <div class="field">
+            <label class="label-small">Password SSH</label>
+            <input name="ssh_pass" type="password" placeholder="••••••"/>
+            <small>Solo se usa si la IP no es 127.0.0.1.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">Ruta Paymenter</label>
+            <input name="pmtr_path" value="/var/www/paymenter" placeholder="/var/www/paymenter"/>
+            <small>Carpeta donde está el código de Paymenter.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">DB host</label>
+            <input name="db_host" value="127.0.0.1" placeholder="127.0.0.1"/>
+            <small>Servidor de base de datos. Normalmente 127.0.0.1.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">DB nombre</label>
+            <input name="db_name" value="paymenter" placeholder="paymenter"/>
+            <small>Nombre de la base de datos de Paymenter.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">DB usuario</label>
+            <input name="db_user" value="paymenter" placeholder="paymenter"/>
+            <small>Usuario MySQL/MariaDB con permisos sobre esa DB.</small>
+          </div>
+          <div class="field">
+            <label class="label-small">DB password</label>
+            <input name="db_pass" type="password" placeholder="(si aplica)"/>
+            <small>Password del usuario de la base de datos.</small>
+          </div>
+        </div>
+
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-top:8px;gap:6px;">
+          <div class="field" style="flex-direction:row;align-items:center;gap:4px;">
+            <span class="label-small">Programación:</span>
+            <select name="schedule_key" style="font-size:11px;border-radius:999px;padding:3px 6px;background:#020617;border:1px solid #1f2937;color:#e5e7eb;">
+              <option value="off">Solo manual</option>
+              <option value="1h">Cada 1 hora</option>
+              <option value="6h">Cada 6 horas</option>
+              <option value="12h">Cada 12 horas</option>
+              <option value="1d">Cada 24 horas</option>
+              <option value="1w">Cada semana</option>
+            </select>
+          </div>
+          <button type="submit" class="btn btn-primary">
+            Guardar servidor
+          </button>
+        </div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Servidores registrados</h2>
+      <p class="label-small">Selecciona uno para ver detalles y administrar backups.</p>
+      <div class="servers-list" id="servers-list"></div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <div class="grid-main">
+      <section class="card scroll">
+        <h2>Detalles del servidor</h2>
+        <p class="label-small" id="server-subtitle">Selecciona un servidor de la izquierda.</p>
+        <div id="server-status" style="margin-top:6px;font-size:11px;">
+          Estado: <span class="badge red" id="server-status-badge">Sin selección</span>
+        </div>
+
+        <div id="server-info-empty" style="font-size:12px;color:#9ca3af;margin-top:10px;">
+          ➜ No hay servidor seleccionado.
+        </div>
+
+        <div id="server-info" style="display:none;margin-top:10px;display:flex;flex-direction:column;gap:8px;">
+          <div class="kv">
+            <div>
+              <div class="kv-label">Nombre interno</div>
+              <div class="kv-val" id="info-label"></div>
+            </div>
+            <div>
+              <div class="kv-label">IP / Host</div>
+              <div class="kv-val" id="info-ip"></div>
+            </div>
+            <div>
+              <div class="kv-label">Ruta Paymenter</div>
+              <div class="kv-val" id="info-path"></div>
+            </div>
+            <div>
+              <div class="kv-label">Base de datos</div>
+              <div class="kv-val" id="info-db"></div>
+            </div>
+            <div>
+              <div class="kv-label">Programación</div>
+              <div class="kv-val" id="info-sched"></div>
+            </div>
+            <div>
+              <div class="kv-label">Retención</div>
+              <div class="kv-val" id="info-ret"></div>
+            </div>
+            <div>
+              <div class="kv-label">Último backup</div>
+              <div class="kv-val" id="info-last"></div>
+            </div>
+            <div>
+              <div class="kv-label">Próximo backup</div>
+              <div class="kv-val" id="info-next"></div>
+            </div>
+          </div>
+
+          <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;">
+            <button class="btn btn-sm" id="btn-edit-ssh">Editar SSH</button>
+            <button class="btn btn-sm" id="btn-edit-pmtr">Editar ruta / DB</button>
+            <button class="btn btn-sm btn-danger" id="btn-delete-server">Eliminar servidor</button>
+          </div>
+
+          <div style="margin-top:8px;">
+            <p class="label-small" style="margin-bottom:4px;">Programación y retención</p>
+            <div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+              <div class="field" style="flex-direction:row;align-items:center;gap:4px;">
+                <span class="label-small">Programa:</span>
+                <select id="edit-schedule" style="font-size:11px;border-radius:999px;padding:3px 6px;background:#020617;border:1px solid #1f2937;color:#e5e7eb;">
+                  <option value="off">Solo manual</option>
+                  <option value="1h">Cada 1h</option>
+                  <option value="6h">Cada 6h</option>
+                  <option value="12h">Cada 12h</option>
+                  <option value="1d">Cada 24h</option>
+                  <option value="1w">Cada semana</option>
+                  <option value="15d">Cada 15 días</option>
+                  <option value="1m">Cada mes</option>
+                </select>
+              </div>
+              <div class="field" style="flex-direction:row;align-items:center;gap:4px;">
+                <span class="label-small">Retención:</span>
+                <select id="edit-retention" style="font-size:11px;border-radius:999px;padding:3px 6px;background:#020617;border:1px solid #1f2937;color:#e5e7eb;">
+                  <option value="off">No borrar automático</option>
+                  <option value="1d">1 día</option>
+                  <option value="3d">3 días</option>
+                  <option value="7d">7 días</option>
+                  <option value="15d">15 días</option>
+                  <option value="30d">30 días</option>
+                  <option value="60d">60 días</option>
+                  <option value="90d">90 días</option>
+                  <option value="180d">180 días</option>
+                  <option value="schedx3">3× intervalo</option>
+                  <option value="schedx7">7× intervalo</option>
+                </select>
+              </div>
+              <label class="label-small" style="display:flex;align-items:center;gap:4px;">
+                <input type="checkbox" id="edit-enabled" style="accent-color:#22c55e;"/>
+                Autosnap activado
+              </label>
+              <button class="btn btn-sm btn-primary" id="btn-save-sched">Guardar cambios</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card scroll">
+        <h2>Backups & Restore</h2>
+        <p class="label-small">Crea snapshots FULL/DB y restaura en la misma VPS o en otra.</p>
+
+        <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">
+          <button class="btn btn-sm btn-primary" id="btn-backup-full">Backup FULL Paymenter</button>
+          <button class="btn btn-sm" id="btn-backup-db">Solo DB + .env</button>
+          <button class="btn btn-sm" id="btn-refresh-backups">Refrescar lista</button>
+          <button class="btn btn-sm btn-danger" id="btn-retention-clean">Aplicar retención ahora</button>
+          <span class="label-small" style="margin-left:auto;" id="backups-summary">Sin servidor.</span>
+        </div>
+
+        <div id="backups-empty" style="font-size:12px;color:#9ca3af;margin-top:8px;">
+          ➜ Selecciona un servidor para ver sus backups.
+        </div>
+
+        <div id="backups-table-wrap" class="scroll" style="display:none;margin-top:6px;max-height:45vh;">
+          <table id="backups-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Archivo</th>
+                <th>Tipo</th>
+                <th>Tamaño</th>
+                <th>Fecha</th>
+                <th>Estado</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+
+        <hr style="border-color:#111827;margin:10px 0;"/>
+
+        <h2>Historial de restores</h2>
+        <p class="label-small">Solo registros; no afecta archivos.</p>
+
+        <div id="restores-empty" style="font-size:12px;color:#9ca3af;margin-top:6px;">
+          ➜ No hay restores todavía.
+        </div>
+
+        <div id="restores-table-wrap" class="scroll" style="display:none;margin-top:6px;max-height:30vh;">
+          <table id="restores-table">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Backup</th>
+                <th>Modo</th>
+                <th>Origen → Destino</th>
+                <th>Auth</th>
+                <th>Estado</th>
+                <th>Notas</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="jobbar" id="jobbar">
+  <div style="min-width:140px;">
+    <div id="jobbar-title">Job</div>
+    <div id="jobbar-status" style="font-size:10px;color:#9ca3af;">Preparando…</div>
+  </div>
+  <div class="jobbar-line"><div class="jobbar-progress" id="jobbar-progress"></div></div>
+</div>
+
+<script>
+(function(){
+  var currentServerId = null;
+  var serversCache = [];
+  var jobTimer = null;
+  var activeJobId = null;
+
+  function $(sel){return document.querySelector(sel);}
+  function createEl(tag){return document.createElement(tag);}
+
+  function toast(msg,isErr){
+    var t=$("#toast"); if(!t) return;
+    t.textContent=msg;
+    t.style.borderColor=isErr?"#f97373":"#4b5563";
+    t.style.display="block";
+    setTimeout(function(){t.style.display="none";},4000);
+  }
+
+  function fmtBytes(size){
+    if(!size||size<=0)return "—";
+    var kb=size/1024,mb=kb/1024,gb=mb/1024;
+    if(gb>=1)return gb.toFixed(2)+" GB";
+    if(mb>=1)return mb.toFixed(1)+" MB";
+    if(kb>=1)return kb.toFixed(0)+" KB";
+    return size+" B";
+  }
+  function fmtDate(iso){
+    if(!iso)return "—";
+    var d=new Date(iso); if(isNaN(d.getTime()))return iso;
+    return d.toLocaleString();
+  }
+  function schedLabel(key){
+    var m={off:"Solo manual","1h":"Cada 1h","6h":"Cada 6h","12h":"Cada 12h","1d":"Cada 24h","1w":"Cada semana","15d":"Cada 15 días","1m":"Cada mes"};
+    return m[key]||key;
+  }
+  function retLabel(key){
+    var m={off:"No borrar automático","1d":"1 día","3d":"3 días","7d":"7 días","15d":"15 días","30d":"30 días","60d":"60 días","90d":"90 días","180d":"180 días","schedx3":"3× intervalo","schedx7":"7× intervalo"};
+    return m[key]||key;
+  }
+
+  function setJobVisible(v){
+    var bar=$("#jobbar"); if(!bar)return;
+    bar.style.display=v?"flex":"none";
+  }
+  function updateJobBar(data){
+    var t=$("#jobbar-title"), s=$("#jobbar-status"), p=$("#jobbar-progress");
+    if(!t||!s||!p)return;
+    t.textContent=(data.type==="backup"?"Backup":"Restore")+" · "+data.id.substring(0,6);
+    s.textContent=data.status.toUpperCase()+" · "+(data.percent||0)+"%";
+    p.style.width=(data.percent||0)+"%";
+  }
+  function startJobPoll(id){
+    activeJobId=id;
+    setJobVisible(true);
+    if(jobTimer)clearInterval(jobTimer);
+    function poll(){
+      fetch("/api/job/"+encodeURIComponent(id))
+        .then(function(r){return r.ok?r.json():Promise.reject();})
+        .then(function(d){
+          updateJobBar(d);
+          if(d.status!=="running"){
+            clearInterval(jobTimer); jobTimer=null;
+            setTimeout(function(){setJobVisible(false);},2500);
+            if(currentServerId){
+              loadServer(currentServerId);
+              loadBackups(currentServerId);
+              loadRestores(currentServerId);
+            }
+          }
+        })
+        .catch(function(){});
+    }
+    poll();
+    jobTimer=setInterval(poll,2000);
+  }
+
+  function loadServers(){
+    var list=$("#servers-list");
+    if(!list)return;
+    list.innerHTML='<div class="label-small" style="margin-top:4px;">Cargando servidores…</div>';
+    fetch("/api/servers")
+      .then(function(r){return r.json();})
+      .then(function(data){
+        serversCache=data.servers||[];
+        if(!serversCache.length){
+          list.innerHTML='<div class="label-small" style="margin-top:4px;">Aún no hay servidores.</div>';
+          return;
+        }
+        list.innerHTML="";
+        serversCache.forEach(function(srv){
+          var item=createEl("div");
+          item.className="srv-item";
+          item.dataset.id=srv.id;
+          if(srv.id===currentServerId)item.classList.add("active");
+          var title=document.createElement("div");
+          title.textContent=srv.label||("Server "+srv.id);
+          var ip=document.createElement("div");
+          ip.className="srv-ip";
+          ip.textContent=srv.ip;
+          var status=document.createElement("div");
+          var b=document.createElement("span");
+          b.className="badge "+(srv.enabled?"green":"red");
+          b.textContent=srv.enabled?"Autosnap ON":"Manual";
+          status.appendChild(b);
+          item.appendChild(title);
+          item.appendChild(ip);
+          item.appendChild(status);
+          item.addEventListener("click",function(){
+            currentServerId=srv.id;
+            document.querySelectorAll(".srv-item").forEach(function(el){el.classList.remove("active");});
+            item.classList.add("active");
+            loadServer(srv.id);
+            loadBackups(srv.id);
+            loadRestores(srv.id);
+          });
+          list.appendChild(item);
+        });
+      })
+      .catch(function(){
+        list.innerHTML='<div class="label-small" style="margin-top:4px;color:#f97373;">Error al cargar servidores.</div>';
+      });
+  }
+
+  function loadServer(id){
+    var srv=serversCache.find(function(s){return s.id===id;});
+    var empty=$("#server-info-empty");
+    var info=$("#server-info");
+    var sub=$("#server-subtitle");
+    var badge=$("#server-status-badge");
+    if(!srv){
+      empty.style.display="block";
+      info.style.display="none";
+      sub.textContent="Selecciona un servidor de la izquierda.";
+      badge.textContent="Sin selección";
+      badge.className="badge red";
+      return;
+    }
+    empty.style.display="none";
+    info.style.display="flex";
+    sub.textContent="Gestionando backups para "+(srv.label||("Server "+srv.id));
+    badge.textContent=srv.enabled?"Autosnap ON":"Manual";
+    badge.className="badge "+(srv.enabled?"green":"red");
+
+    $("#info-label").textContent=srv.label||"—";
+    $("#info-ip").textContent=srv.ip||"—";
+    $("#info-path").textContent=srv.pmtr_path||"/var/www/paymenter";
+    $("#info-db").textContent=(srv.db_name||"paymenter")+" @ "+(srv.db_host||"127.0.0.1")+" (user "+(srv.db_user||"paymenter")+")";
+    $("#info-sched").textContent=schedLabel(srv.schedule_key||"off");
+    $("#info-ret").textContent=retLabel(srv.retention_key||"off");
+    $("#info-last").textContent=fmtDate(srv.last_run);
+    $("#info-next").textContent=fmtDate(srv.next_run);
+
+    $("#edit-schedule").value=srv.schedule_key||"off";
+    $("#edit-retention").value=srv.retention_key||"off";
+    $("#edit-enabled").checked=!!srv.enabled;
+  }
+
+  function loadBackups(serverId){
+    var empty=$("#backups-empty");
+    var wrap=$("#backups-table-wrap");
+    var tbody=$("#backups-table tbody");
+    var summary=$("#backups-summary");
+    if(!serverId){
+      empty.style.display="block";
+      empty.textContent="➜ Selecciona un servidor para ver sus backups.";
+      wrap.style.display="none";
+      summary.textContent="Sin servidor.";
+      return;
+    }
+    empty.style.display="block";
+    empty.textContent="Cargando backups…";
+    wrap.style.display="none";
+    summary.textContent="Cargando…";
+    fetch("/api/backups?server_id="+encodeURIComponent(serverId))
+      .then(function(r){return r.json();})
+      .then(function(data){
+        var list=data.backups||[];
+        if(!list.length){
+          empty.style.display="block";
+          empty.textContent="No hay backups aún.";
+          wrap.style.display="none";
+          summary.textContent="0 backups.";
+          tbody.innerHTML="";
+          return;
+        }
+        empty.style.display="none";
+        wrap.style.display="block";
+        tbody.innerHTML="";
+        summary.textContent=list.length+" backups.";
+        list.forEach(function(b){
+          var tr=createEl("tr");
+          function td(text){var c=createEl("td");c.textContent=text;return c;}
+          tr.appendChild(td(b.id));
+          tr.appendChild(td(b.filename));
+          tr.appendChild(td((b.type||"full").toUpperCase()));
+          tr.appendChild(td(fmtBytes(b.size_bytes)));
+          tr.appendChild(td(fmtDate(b.created_at)));
+          tr.appendChild(td((b.status||"").toUpperCase()));
+
+          var actions=createEl("td");
+          actions.style.whiteSpace="nowrap";
+
+          var btnDl=createEl("button");
+          btnDl.className="btn btn-sm";
+          btnDl.textContent="Descargar";
+          btnDl.onclick=function(){window.open("/api/backups/download/"+b.id,"_blank");};
+          actions.appendChild(btnDl);
+
+          var btnSame=createEl("button");
+          btnSame.className="btn btn-sm btn-primary";
+          btnSame.style.marginLeft="4px";
+          btnSame.textContent="Restore aquí";
+          btnSame.onclick=function(){
+            if(!confirm("Restaurar este backup sobre la misma VPS?"))return;
+            doRestore(b.id,"same");
+          };
+          actions.appendChild(btnSame);
+
+          var btnOther=createEl("button");
+          btnOther.className="btn btn-sm";
+          btnOther.style.marginLeft="4px";
+          btnOther.textContent="→ Otra VPS";
+          btnOther.onclick=function(){
+            var ip=prompt("IP/host de la nueva VPS:");
+            if(!ip)return;
+            var user=prompt("Usuario SSH (root por defecto):")||"root";
+            var pass=prompt("Password SSH de la VPS destino:");
+            if(!pass)return;
+            doRestore(b.id,"other",{ip:ip,ssh_user:user,ssh_pass:pass});
+          };
+          actions.appendChild(btnOther);
+
+          var btnDel=createEl("button");
+          btnDel.className="btn btn-sm btn-danger";
+          btnDel.style.marginLeft="4px";
+          btnDel.textContent="Eliminar";
+          btnDel.onclick=function(){
+            if(!confirm("Eliminar este backup?"))return;
+            fetch("/api/backups/"+b.id,{method:"DELETE"})
+              .then(function(r){return r.json();})
+              .then(function(){toast("Backup eliminado.");loadBackups(serverId);})
+              .catch(function(){toast("Error al eliminar backup.",true);});
+          };
+          actions.appendChild(btnDel);
+
+          tr.appendChild(actions);
+          tbody.appendChild(tr);
+        });
+      })
+      .catch(function(){
+        empty.style.display="block";
+        empty.textContent="Error al cargar backups.";
+        wrap.style.display="none";
+        summary.textContent="Error.";
+      });
+  }
+
+  function loadRestores(serverId){
+    var empty=$("#restores-empty");
+    var wrap=$("#restores-table-wrap");
+    var tbody=$("#restores-table tbody");
+    if(!serverId){
+      empty.style.display="block";
+      empty.textContent="Selecciona un servidor.";
+      wrap.style.display="none";
+      tbody.innerHTML="";
+      return;
+    }
+    empty.style.display="block";
+    empty.textContent="Cargando historial…";
+    wrap.style.display="none";
+    tbody.innerHTML="";
+    fetch("/api/restores?server_id="+encodeURIComponent(serverId))
+      .then(function(r){return r.json();})
+      .then(function(data){
+        var list=data.restores||[];
+        if(!list.length){
+          empty.style.display="block";
+          empty.textContent="No hay restores todavía.";
+          wrap.style.display="none";
+          return;
+        }
+        empty.style.display="none";
+        wrap.style.display="block";
+        list.forEach(function(rw){
+          var tr=createEl("tr");
+          function td(text){var c=createEl("td");c.textContent=text;return c;}
+          tr.appendChild(td(rw.id));
+          tr.appendChild(td("#"+rw.backup_id+" · "+(rw.filename||"")));
+          tr.appendChild(td(rw.mode==="same"?"Misma VPS":"Otra VPS"));
+          var origin=(rw.source_label||"Origen")+" ("+(rw.source_ip||"")+")";
+          var dest = rw.mode==="same"
+            ? origin+" (self)"
+            : (rw.target_label||"Destino")+" ("+(rw.target_ip||rw.target_ip2||"")+")";
+          tr.appendChild(td(origin+" → "+dest));
+          tr.appendChild(td(rw.preserve_auth?"Auth preservada":"Auth sobreescrita"));
+          tr.appendChild(td((rw.status||"").toUpperCase()));
+          tr.appendChild(td((rw.note||"").slice(0,60)));
+
+          var actions=createEl("td");
+          var btnDel=createEl("button");
+          btnDel.className="btn btn-sm";
+          btnDel.textContent="Quitar";
+          btnDel.onclick=function(){
+            if(!confirm("Eliminar registro de restore #"+rw.id+"?"))return;
+            fetch("/api/restores/"+rw.id,{method:"DELETE"})
+              .then(function(r){return r.json();})
+              .then(function(){toast("Registro eliminado.");loadRestores(serverId);})
+              .catch(function(){toast("Error al eliminar registro.",true);});
+          };
+          actions.appendChild(btnDel);
+          tr.appendChild(actions);
+          tbody.appendChild(tr);
+        });
+      })
+      .catch(function(){
+        empty.style.display="block";
+        empty.textContent="Error al cargar historial.";
+        wrap.style.display="none";
+      });
+  }
+
+  function doBackup(kind){
+    if(!currentServerId){toast("Selecciona un servidor primero.",true);return;}
+    fetch("/api/servers/"+currentServerId+"/backup-now",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({kind:kind})
+    })
+      .then(function(r){return r.json();})
+      .then(function(data){
+        if(data.error){
+          toast(data.error,true);
+          if(data.job_id)startJobPoll(data.job_id);
+          return;
+        }
+        if(!data.job_id){toast("No se recibió job_id.",true);return;}
+        toast("Backup iniciado.");
+        startJobPoll(data.job_id);
+      })
+      .catch(function(){toast("Error al iniciar backup.",true);});
+  }
+
+  function doRestore(backupId,mode,other){
+    var payload={backup_id:backupId,mode:mode};
+    if(mode==="other"&&other){
+      payload.ip=other.ip;
+      payload.ssh_user=other.ssh_user;
+      payload.ssh_pass=other.ssh_pass;
+    }
+    fetch("/api/restore",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)
+    })
+      .then(function(r){return r.json();})
+      .then(function(data){
+        if(data.error){toast(data.error,true);return;}
+        if(data.job_id){toast("Restore iniciado.");startJobPoll(data.job_id);}
+      })
+      .catch(function(){toast("Error al iniciar restore.",true);});
+  }
+
+  function saveSched(){
+    if(!currentServerId){toast("Selecciona un servidor.",true);return;}
+    var srv=serversCache.find(function(s){return s.id===currentServerId;});
+    if(!srv)return;
+    var payload={
+      schedule_key:$("#edit-schedule").value,
+      retention_key:$("#edit-retention").value,
+      enabled:$("#edit-enabled").checked
+    };
+    fetch("/api/servers/"+currentServerId,{
+      method:"PUT",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(payload)
+    })
+      .then(function(r){return r.json();})
+      .then(function(data){
+        if(data.error){toast(data.error,true);return;}
+        toast("Programación y retención actualizadas.");
+        loadServers();
+      })
+      .catch(function(){toast("Error al guardar cambios.",true);});
+  }
+
+  function initForm(){
+    var form=$("#form-new-server");
+    if(form){
+      form.addEventListener("submit",function(ev){
+        ev.preventDefault();
+        var fd=new FormData(form);
+        var body={
+          label:fd.get("label")||"",
+          ip:(fd.get("ip")||"").trim(),
+          ssh_user:(fd.get("ssh_user")||"root").trim(),
+          ssh_pass:fd.get("ssh_pass")||"",
+          pmtr_path:(fd.get("pmtr_path")||"/var/www/paymenter").trim(),
+          db_host:(fd.get("db_host")||"127.0.0.1").trim(),
+          db_name:(fd.get("db_name")||"paymenter").trim(),
+          db_user:(fd.get("db_user")||"paymenter").trim(),
+          db_pass:fd.get("db_pass")||"",
+          schedule_key:fd.get("schedule_key")||"off",
+          enabled:(fd.get("schedule_key")||"off")!=="off"
+        };
+        if(!body.ip){toast("IP/host es obligatorio.",true);return;}
+        if(body.ip!=="127.0.0.1"&&!body.ssh_pass){
+          toast("Para IP remota debes indicar password SSH.",true);return;
+        }
+        fetch("/api/servers",{
+          method:"POST",
+          headers:{"Content-Type":"application/json"},
+          body:JSON.stringify(body)
+        })
+          .then(function(r){return r.json();})
+          .then(function(data){
+            if(data.error){toast(data.error,true);return;}
+            toast("Servidor registrado.");
+            form.reset();
+            loadServers();
+          })
+          .catch(function(){toast("Error al guardar servidor.",true);});
+      });
+    }
+
+    $("#btn-backup-full").onclick=function(){doBackup("full");};
+    $("#btn-backup-db").onclick=function(){doBackup("db");};
+    $("#btn-refresh-backups").onclick=function(){
+      if(!currentServerId){toast("Selecciona un servidor.",true);return;}
+      loadBackups(currentServerId);
+    };
+    $("#btn-retention-clean").onclick=function(){
+      if(!currentServerId){toast("Selecciona un servidor.",true);return;}
+      if(!confirm("Aplicar retención y borrar backups antiguos?"))return;
+      fetch("/api/servers/"+currentServerId+"/cleanup",{method:"POST"})
+        .then(function(r){return r.json();})
+        .then(function(data){
+          toast("Retención aplicada. Eliminados: "+(data.deleted||0));
+          loadBackups(currentServerId);
+        })
+        .catch(function(){toast("Error al aplicar retención.",true);});
+    };
+    $("#btn-save-sched").onclick=saveSched;
+
+    $("#btn-delete-server").onclick=function(){
+      if(!currentServerId){toast("Selecciona un servidor.",true);return;}
+      if(!confirm("Eliminar este servidor del panel y sus backups locales?"))return;
+      fetch("/api/servers/"+currentServerId,{method:"DELETE"})
+        .then(function(r){return r.json();})
+        .then(function(data){
+          if(data.error){toast(data.error,true);return;}
+          toast("Servidor eliminado.");
+          currentServerId=null;
+          loadServers();
+          loadBackups(null);
+          loadRestores(null);
+          loadServer(null);
+        })
+        .catch(function(){toast("Error al eliminar servidor.",true);});
+    };
+
+    $("#btn-edit-ssh").onclick=function(){
+      if(!currentServerId){toast("Selecciona un servidor.",true);return;}
+      var srv=serversCache.find(function(s){return s.id===currentServerId;});
+      if(!srv)return;
+      var user=prompt("Usuario SSH:",srv.ssh_user||"root")||srv.ssh_user||"root";
+      var pass=prompt("Password SSH (deja vacío para no cambiar):","");
+      var body={};
+      if(user&&user.trim())body.ssh_user=user.trim();
+      if(pass!==null && pass!=="")body.ssh_pass=pass;
+      if(!Object.keys(body).length)return;
+      fetch("/api/servers/"+currentServerId+"/creds",{
+        method:"PUT",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(body)
+      })
+        .then(function(r){return r.json();})
+        .then(function(data){
+          if(data.error){toast(data.error,true);return;}
+          toast("Credenciales SSH actualizadas.");
+          loadServers();
+        })
+        .catch(function(){toast("Error al actualizar SSH.",true);});
+    };
+
+    $("#btn-edit-pmtr").onclick=function(){
+      if(!currentServerId){toast("Selecciona un servidor.",true);return;}
+      var srv=serversCache.find(function(s){return s.id===currentServerId;});
+      if(!srv)return;
+      var path=prompt("Ruta Paymenter:",srv.pmtr_path||"/var/www/paymenter")||srv.pmtr_path||"/var/www/paymenter";
+      var dbhost=prompt("DB host:",srv.db_host||"127.0.0.1")||srv.db_host||"127.0.0.1";
+      var dbname=prompt("DB nombre:",srv.db_name||"paymenter")||srv.db_name||"paymenter";
+      var dbuser=prompt("DB usuario:",srv.db_user||"paymenter")||srv.db_user||"paymenter";
+      var dbpass=prompt("DB password (deja vacío para no cambiar):","");
+      var body={pmtr_path:path.trim(),db_host:dbhost.trim(),db_name:dbname.trim(),db_user:dbuser.trim()};
+      if(dbpass!==null && dbpass!=="")body.db_pass=dbpass;
+      fetch("/api/servers/"+currentServerId+"/paymenter",{
+        method:"PUT",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify(body)
+      })
+        .then(function(r){return r.json();})
+        .then(function(data){
+          if(data.error){toast(data.error,true);return;}
+          toast("Datos de Paymenter actualizados.");
+          loadServers();
+        })
+        .catch(function(){toast("Error al actualizar Paymenter.",true);});
+    };
+  }
+
+  document.addEventListener("DOMContentLoaded",function(){
+    initForm();
+    loadServers();
+    loadBackups(null);
+    loadRestores(null);
+  });
+})();
+</script>
+</body>
+</html>`;
+}
+// ===== Export =====
+module.exports = { createPanelRouter };
