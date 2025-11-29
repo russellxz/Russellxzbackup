@@ -1,1 +1,2028 @@
 
+"use strict";
+
+const express = require("express");
+const router = express.Router();
+const db = require("./db");
+const path = require("path");
+const fs = require("fs");
+const PDFDocument = require("pdfkit");
+const https = require("https");
+
+// ================================================
+// CONFIG LOGO (cache en memoria para no bajarlo siempre)
+// ================================================
+const LOGO_URL = "https://cdn.russellxz.click/fa76c609.png";
+let logoCache = null;
+
+function getLogoBuffer(cb) {
+  if (logoCache) return cb(null, logoCache);
+
+  https
+    .get(LOGO_URL, (res) => {
+      if (res.statusCode !== 200) {
+        console.error("No se pudo descargar el logo, status:", res.statusCode);
+        res.resume();
+        return cb(null, null);
+      }
+      const chunks = [];
+      res.on("data", (d) => chunks.push(d));
+      res.on("end", () => {
+        try {
+          logoCache = Buffer.concat(chunks);
+          cb(null, logoCache);
+        } catch (e) {
+          console.error("Error al combinar datos de logo:", e.message);
+          cb(null, null);
+        }
+      });
+    })
+    .on("error", (err) => {
+      console.error("Error descargando logo:", err.message);
+      cb(null, null);
+    });
+}
+
+// ================================================
+// MIDDLEWARE: solo operadores (y opcionalmente admin)
+// ================================================
+function requireOperator(req, res, next) {
+  const user = req.session.user;
+  if (!user || (user.role !== "operator" && user.role !== "admin")) {
+    return res.redirect("/login");
+  }
+  next();
+}
+router.use(requireOperator);
+
+// ================================================
+// HELPERS
+// ================================================
+function formatDate(isoString) {
+  if (!isoString) return "";
+  return new Date(isoString).toLocaleString("es-PA", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function formatDuration(seconds) {
+  if (!seconds || seconds <= 0) return "00:00:00";
+  const s = Math.floor(seconds);
+  const h = String(Math.floor(s / 3600)).padStart(2, "0");
+  const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
+  const ss = String(s % 60).padStart(2, "0");
+  return `${h}:${m}:${ss}`;
+}
+
+function renderAttachment(url) {
+  if (!url) return "";
+  const ext = path.extname(url).toLowerCase();
+  if ([".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(ext)) {
+    return `<a href="${url}" target="_blank"><img src="${url}" class="media-preview"></a>`;
+  } else if ([".mp4", ".mov", ".webm"].includes(ext)) {
+    return `<video src="${url}" controls class="media-preview"></video>`;
+  } else if (ext === ".pdf") {
+    return `<a href="${url}" target="_blank" class="file-link pdf-link"><i class="fa-solid fa-file-pdf"></i> Ver PDF</a>`;
+  } else {
+    return `<a href="${url}" target="_blank" class="file-link"><i class="fa-solid fa-paperclip"></i> Descargar Archivo</a>`;
+  }
+}
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+// Normalizamos valores del body en arrays
+function toArray(v) {
+  if (!v) return [];
+  if (Array.isArray(v)) return v.filter((x) => x && String(x).trim() !== "");
+  return [v].filter((x) => x && String(x).trim() !== "");
+}
+
+// ================================================
+// 1) DASHBOARD OPERADOR
+// ================================================
+router.get("/", (req, res) => {
+  const user = req.session.user;
+
+  // Reportes activos (sin operador)
+  const activos = db
+    .prepare(
+      `
+      SELECT r.*
+      FROM work_reports r
+      WHERE r.status = 'active'
+      ORDER BY r.created_at DESC
+    `,
+    )
+    .all();
+
+  // Reportes en proceso (con operador, todos)
+  const enProceso = db
+    .prepare(
+      `
+      SELECT r.*, u.name AS op_name, u.surname AS op_surname
+      FROM work_reports r
+      LEFT JOIN users u ON r.operator_id = u.id
+      WHERE r.status = 'process'
+      ORDER BY r.created_at DESC
+    `,
+    )
+    .all();
+
+  // Reportes cerrados del propio operador (historial)
+  const cerradosMios = db
+    .prepare(
+      `
+      SELECT r.*, u.name AS op_name, u.surname AS op_surname
+      FROM work_reports r
+      LEFT JOIN users u ON r.operator_id = u.id
+      WHERE r.status = 'closed' AND r.operator_id = ?
+      ORDER BY r.completed_at DESC, r.created_at DESC
+    `,
+    )
+    .all(user.id);
+
+  const activosHtml = activos
+    .map(
+      (r) => `
+      <tr onclick="window.location='/operator/dashboard/report/${r.id}'" class="row-hover">
+        <td>#${r.id}</td>
+        <td>
+          <div class="subject">${r.title}</div>
+          <div class="date">Creado: ${formatDate(r.created_at)}</div>
+        </td>
+        <td>
+          <form action="/operator/dashboard/report/${r.id}/take" method="POST" onclick="event.stopPropagation()">
+            <button class="btn-mini btn-primary"><i class="fa-solid fa-hand"></i> Tomar</button>
+          </form>
+        </td>
+      </tr>
+    `,
+    )
+    .join("");
+
+  const procesoHtml = enProceso
+    .map((r) => {
+      const isMine = r.operator_id === user.id;
+      const opName = r.op_name
+        ? `${r.op_name} ${r.op_surname || ""}`.trim()
+        : "Sin datos";
+      const startedInfo = r.work_started_at
+        ? `Trabajo desde: ${formatDate(r.work_started_at)}`
+        : "Trabajo aún no iniciado";
+      return `
+      <tr onclick="window.location='/operator/dashboard/report/${r.id}'" class="row-hover">
+        <td>#${r.id}</td>
+        <td>
+          <div class="subject">${r.title}</div>
+          <div class="date">${startedInfo}</div>
+        </td>
+        <td>
+          <span class="tag ${isMine ? "tag-me" : "tag-op"}">
+            <i class="fa-solid fa-helmet-safety"></i>
+            ${opName}${isMine ? " (Tú)" : ""}
+          </span>
+        </td>
+      </tr>
+    `;
+    })
+    .join("");
+
+  const cerradosHtml = cerradosMios
+    .map(
+      (r) => `
+      <tr onclick="window.location='/operator/dashboard/report/${r.id}'" class="row-hover">
+        <td>#${r.id}</td>
+        <td>
+          <div class="subject">${r.title}</div>
+          <div class="date">
+            Finalizado: ${formatDate(r.completed_at || r.created_at)} ·
+            Tiempo: ${formatDuration(r.work_seconds_total || 0)}
+          </div>
+        </td>
+        <td><span class="badge badge-green">Cerrado</span></td>
+      </tr>
+    `,
+    )
+    .join("");
+
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Panel Operador | Kairos</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+:root { --primary:#2e7d32; --dark:#1b5e20; --bg:#f4f6f9; --white:#ffffff; --danger:#d32f2f; --accent:#ff6f00; }
+*{box-sizing:border-box;}
+body{margin:0;font-family:'Poppins',sans-serif;background:var(--bg);color:#333;}
+/* NAV */
+.top-nav{
+  background:var(--white);
+  padding:12px 15px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  box-shadow:0 2px 8px rgba(0,0,0,0.05);
+  position:sticky;
+  top:0;
+  z-index:10;
+}
+.back-link{
+  text-decoration:none;
+  color:#555;
+  font-weight:600;
+  display:flex;
+  align-items:center;
+  gap:6px;
+  font-size:0.9rem;
+}
+.back-link:hover{color:var(--primary);}
+.page-title{margin:0;font-size:1rem;color:var(--primary);font-weight:700;}
+.badge-role{
+  font-size:0.7rem;
+  background:#e3f2fd;
+  color:#1976d2;
+  padding:2px 6px;
+  border-radius:4px;
+  font-weight:700;
+}
+/* LAYOUT */
+.container{max-width:1100px;margin:15px auto;padding:0 12px;}
+.section-card{
+  background:var(--white);
+  border-radius:12px;
+  padding:15px;
+  box-shadow:0 2px 5px rgba(0,0,0,0.03);
+  margin-bottom:15px;
+}
+.section-title{
+  margin:0 0 10px;
+  font-size:0.95rem;
+  font-weight:700;
+  color:#555;
+  display:flex;
+  align-items:center;
+  gap:8px;
+}
+.section-title i{color:var(--primary);}
+table{width:100%;border-collapse:collapse;}
+th,td{padding:10px 8px;font-size:0.85rem;border-bottom:1px solid #f1f1f1;}
+th{text-align:left;color:#888;background:#fafafa;}
+tr.row-hover:hover{background:#f0fdf4;cursor:pointer;}
+.subject{font-weight:600;}
+.date{font-size:0.75rem;color:#888;}
+.btn-mini{
+  border:none;
+  padding:6px 10px;
+  border-radius:6px;
+  font-size:0.75rem;
+  font-weight:600;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+}
+.btn-primary{background:var(--primary);color:#fff;}
+.btn-danger{background:var(--danger);color:#fff;}
+.badge{padding:3px 8px;border-radius:8px;font-size:0.7rem;font-weight:700;white-space:nowrap;}
+.badge-green{background:#e8f5e9;color:#2e7d32;}
+.tag{
+  font-size:0.7rem;
+  padding:3px 7px;
+  border-radius:20px;
+  font-weight:600;
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+}
+.tag-op{background:#e3f2fd;color:#1565c0;border:1px solid #bbdefb;}
+.tag-me{background:#fff3e0;color:#ef6c00;border:1px solid #ffe0b2;}
+/* FOOTER */
+.footer-bar{
+  position:fixed;
+  bottom:0;
+  left:0;
+  right:0;
+  background:var(--white);
+  box-shadow:0 -2px 8px rgba(0,0,0,0.08);
+  padding:10px 15px;
+  display:flex;
+  justify-content:space-between;
+  align-items:center;
+}
+.footer-bar small{font-size:0.75rem;color:#777;}
+.btn-exit{
+  background:var(--danger);
+  color:#fff;
+  border:none;
+  padding:8px 12px;
+  border-radius:8px;
+  font-size:0.8rem;
+  font-weight:600;
+  text-decoration:none;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+@media(max-width:600px){
+  th:nth-child(1),td:nth-child(1){width:40px;}
+}
+</style>
+</head>
+<body>
+  <div class="top-nav">
+    <a href="/" class="back-link"><i class="fa-solid fa-arrow-left"></i> Volver</a>
+    <h1 class="page-title">Panel Operador <span class="badge-role">OP</span></h1>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="container">
+    <div class="section-card">
+      <h2 class="section-title"><i class="fa-solid fa-list-check"></i> Reportes activos (disponibles)</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Reporte</th><th>Acción</th></tr></thead>
+        <tbody>
+          ${
+            activosHtml ||
+            `<tr><td colspan="3" style="text-align:center;padding:15px;color:#999;">No hay reportes activos por ahora.</td></tr>`
+          }
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-card">
+      <h2 class="section-title"><i class="fa-solid fa-helmet-safety"></i> Reportes en proceso</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Reporte</th><th>Operador</th></tr></thead>
+        <tbody>
+          ${
+            procesoHtml ||
+            `<tr><td colspan="3" style="text-align:center;padding:15px;color:#999;">No hay reportes en proceso.</td></tr>`
+          }
+        </tbody>
+      </table>
+    </div>
+
+    <div class="section-card">
+      <h2 class="section-title"><i class="fa-solid fa-check-circle"></i> Mis reportes finalizados</h2>
+      <table>
+        <thead><tr><th>ID</th><th>Reporte</th><th>Estado</th></tr></thead>
+        <tbody>
+          ${
+            cerradosHtml ||
+            `<tr><td colspan="3" style="text-align:center;padding:15px;color:#999;">Aún no has finalizado reportes.</td></tr>`
+          }
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="footer-bar">
+    <small>Conectado como: ${user.name} (${user.email})</small>
+    <a href="/logout" class="btn-exit">
+      <i class="fa-solid fa-door-open"></i> Salir del panel
+    </a>
+  </div>
+</body>
+</html>`);
+});
+
+// ================================================
+// 2) VER REPORTE (SIN CHAT) + FORMULARIOS
+// ================================================
+router.get("/report/:id", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+
+  const r = db
+    .prepare(
+      `
+      SELECT r.*,
+             op.name     AS op_name,
+             op.surname  AS op_surname,
+             op.email    AS op_email,
+             op.phone    AS op_phone,
+             cli.name    AS client_name,
+             cli.surname AS client_surname,
+             cli.email   AS client_email,
+             cli.phone   AS client_phone,
+             cli.address AS client_address
+      FROM work_reports r
+      LEFT JOIN users op  ON r.operator_id = op.id
+      LEFT JOIN users cli ON r.client_id   = cli.id
+      WHERE r.id = ?
+    `,
+    )
+    .get(id);
+
+  if (!r) return res.status(404).send("Reporte no encontrado");
+
+  const isMine = r.operator_id === user.id;
+  const isClosed = r.status === "closed";
+
+  // ------------------------------------------------------------------
+  // LEEMOS service_form (JSON) PARA SOBREESCRIBIR DATOS DEL CLIENTE
+  // - Lo que escriba el técnico en el formulario manda sobre la ficha
+  //   del cliente, pero seguimos guardando el original por si acaso.
+  // ------------------------------------------------------------------
+  let serviceForm = null;
+  try {
+    serviceForm = r.service_form ? JSON.parse(r.service_form) : null;
+  } catch (e) {
+    console.error("Error parseando service_form:", e.message);
+    serviceForm = null;
+  }
+
+  const clientName =
+    (serviceForm && serviceForm.client_name) ||
+    (r.client_name
+      ? `${r.client_name} ${r.client_surname || ""}`.trim()
+      : "Sin cliente asignado");
+
+  const clientEmail =
+    (serviceForm && serviceForm.client_email) || r.client_email || "N/A";
+
+  const clientPhone =
+    (serviceForm && serviceForm.client_phone) || r.client_phone || "N/A";
+
+  const clientAddress =
+    (serviceForm && serviceForm.client_address) ||
+    r.client_address ||
+    "N/D";
+
+  // Assets del admin
+  let adminAssetsHtml = "";
+  try {
+    const assets = JSON.parse(r.admin_assets || "[]");
+    adminAssetsHtml = assets.map((a) => renderAttachment(a)).join(" ");
+  } catch {
+    adminAssetsHtml = "";
+  }
+
+  // PDFs ya generados
+  let servicePdfHtml = "";
+  if (r.service_pdf_url) {
+    servicePdfHtml = `
+      <div class="pdf-item">
+        <a href="${r.service_pdf_url}" target="_blank" class="file-link pdf-link">
+          <i class="fa-solid fa-file-pdf"></i> Ver PDF de servicio
+        </a>
+        ${
+          isMine
+            ? `<form action="/operator/dashboard/report/${id}/service-pdf/delete" method="POST" onsubmit="return confirm('¿Eliminar PDF de servicio?');">
+                 <button type="submit" class="btn-chip btn-delete-pdf"><i class="fa-solid fa-trash"></i></button>
+               </form>`
+            : ""
+        }
+      </div>
+    `;
+  }
+
+  let photoPdfsHtml = "";
+  try {
+    const arr = JSON.parse(r.photo_pdfs || "[]");
+    if (Array.isArray(arr) && arr.length) {
+      photoPdfsHtml = arr
+        .map(
+          (url, idx) => `
+        <div class="pdf-item">
+          <a href="${url}" target="_blank" class="file-link pdf-link">
+            <i class="fa-solid fa-file-pdf"></i> Reporte fotográfico #${idx + 1}</a>
+          ${
+            isMine
+              ? `<form action="/operator/dashboard/report/${id}/photo-pdf/delete" method="POST" onsubmit="return confirm('¿Eliminar este reporte fotográfico?');">
+                   <input type="hidden" name="index" value="${idx}">
+                   <button type="submit" class="btn-chip btn-delete-pdf"><i class="fa-solid fa-trash"></i></button>
+                 </form>`
+              : ""
+          }
+        </div>
+      `,
+        )
+        .join("");
+    }
+  } catch {
+    photoPdfsHtml = "";
+  }
+
+  const statusLabel =
+    r.status === "process"
+      ? "En Proceso"
+      : r.status === "closed"
+      ? "Cerrado"
+      : "Activo";
+
+  const opInfo =
+    r.operator_id && r.op_name
+      ? `${r.op_name} ${r.op_surname || ""}`.trim()
+      : "Sin asignar";
+
+  const canStart =
+    isMine && r.status === "process" && !r.work_started_at && !isClosed;
+  const canRelease = isMine && r.status === "process" && !isClosed;
+  const canClose = isMine && r.status === "process" && !!r.work_started_at;
+  const workStartedMs =
+    r.work_started_at && !isClosed
+      ? new Date(r.work_started_at).getTime()
+      : "";
+
+  const workedTotal = r.work_seconds_total
+    ? formatDuration(r.work_seconds_total)
+    : "00:00:00";
+
+  res.send(`<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Reporte #${r.id} | Operador</title>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@400;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+<style>
+body{
+  margin:0;
+  font-family:'Poppins',sans-serif;
+  background:#0f172a;
+  color:#111827;
+  display:flex;
+  flex-direction:column;
+  min-height:100vh;
+}
+.header{
+  background:#020617;
+  padding:12px 16px;
+  display:flex;
+  align-items:center;
+  gap:10px;
+  box-shadow:0 2px 8px rgba(0,0,0,0.45);
+  position:sticky;
+  top:0;
+  z-index:10;
+}
+.header a{
+  color:#e5e7eb;
+  text-decoration:none;
+  font-size:1.2rem;
+}
+.header-title{
+  flex:1;
+  color:#e5e7eb;
+}
+.header-title h3{
+  margin:0;
+  font-size:0.98rem;
+}
+.header-title small{
+  font-size:0.78rem;
+  color:#9ca3af;
+}
+.badge-status{
+  font-size:0.7rem;
+  padding:3px 7px;
+  border-radius:999px;
+  font-weight:700;
+}
+.badge-active{background:#fef9c3;color:#92400e;}
+.badge-process{background:#e0f2fe;color:#0369a1;}
+.badge-closed{background:#dcfce7;color:#166534;}
+.container{
+  flex:1;
+  padding:16px;
+  max-width:1200px;
+  margin:0 auto 30px auto;
+}
+.grid{
+  display:grid;
+  grid-template-columns: minmax(0,2fr) minmax(0,3fr);
+  gap:16px;
+}
+.card{
+  background:#f9fafb;
+  border-radius:14px;
+  padding:14px 16px;
+  box-shadow:0 2px 6px rgba(15,23,42,0.12);
+}
+.card h4{
+  margin:0 0 8px 0;
+  font-size:0.95rem;
+  color:#111827;
+  display:flex;
+  align-items:center;
+  gap:6px;
+}
+.card h4 i{color:#16a34a;}
+.label{font-size:0.76rem;color:#6b7280;margin-bottom:2px;}
+.value{font-size:0.88rem;color:#111827;font-weight:500;}
+.row{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:6px;}
+.row > div{flex:1 1 150px;}
+.chip{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  background:#e5f2ff;
+  color:#0f172a;
+  border-radius:999px;
+  padding:4px 10px;
+  font-size:0.78rem;
+  font-weight:600;
+}
+.media-preview{
+  max-width:120px;
+  max-height:120px;
+  border-radius:6px;
+  margin:4px 4px 0 0;
+  object-fit:cover;
+  border:1px solid #e5e7eb;
+}
+video.media-preview{width:220px;max-height:none;}
+.file-link{
+  display:inline-flex;
+  align-items:center;
+  gap:5px;
+  background:#e5e7eb;
+  padding:6px 10px;
+  border-radius:6px;
+  text-decoration:none;
+  color:#111827;
+  font-size:0.8rem;
+  margin-top:4px;
+}
+.pdf-link{background:#fee2e2;color:#b91c1c;}
+.pdf-item{
+  display:flex;
+  align-items:center;
+  gap:6px;
+  flex-wrap:wrap;
+  margin-bottom:4px;
+}
+.btn-delete-pdf{
+  background:#fee2e2;
+  color:#b91c1c;
+}
+.btn-delete-pdf:hover{
+  background:#fecaca;
+}
+.btn-bar{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-top:8px;
+}
+.btn{
+  border:none;
+  padding:7px 12px;
+  border-radius:8px;
+  font-size:0.8rem;
+  font-weight:600;
+  cursor:pointer;
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+}
+.btn-primary{background:#16a34a;color:#f9fafb;}
+.btn-warning{background:#f97316;color:#111827;}
+.btn-danger{background:#dc2626;color:#f9fafb;}
+.btn-outline{
+  background:transparent;
+  color:#e5e7eb;
+  border:1px solid #4b5563;
+}
+.btn[disabled]{opacity:0.5;cursor:not-allowed;}
+.badge-time{
+  display:inline-flex;
+  align-items:center;
+  gap:6px;
+  padding:4px 9px;
+  border-radius:999px;
+  background:#020617;
+  color:#e5e7eb;
+  font-size:0.78rem;
+}
+.badge-time i{color:#22c55e;}
+.timer{
+  font-variant-numeric:tabular-nums;
+  font-weight:700;
+}
+.form-grid{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+.form-group{display:flex;flex-direction:column;margin-bottom:6px;}
+.form-group label{
+  font-size:0.75rem;
+  color:#4b5563;
+  margin-bottom:3px;
+}
+.form-group input,
+.form-group textarea,
+.form-group select{
+  border-radius:8px;
+  border:1px solid #d1d5db;
+  padding:7px 9px;
+  font-family:inherit;
+  font-size:0.83rem;
+}
+.form-group textarea{min-height:60px;resize:vertical;}
+.tag-list{
+  display:flex;
+  flex-direction:column;
+  gap:4px;
+  margin-bottom:6px;
+}
+.tag-item{
+  display:flex;
+  gap:6px;
+}
+.tag-item input{
+  flex:1;
+  border-radius:8px;
+  border:1px solid #d1d5db;
+  padding:7px 9px;
+  font-size:0.8rem;
+}
+.btn-chip{
+  border:none;
+  background:#e5e7eb;
+  border-radius:999px;
+  padding:3px 8px;
+  font-size:0.72rem;
+  cursor:pointer;
+}
+.btn-chip i{font-size:0.7rem;}
+.table-scroll{overflow-x:auto;}
+.products-table{
+  width:100%;
+  border-collapse:collapse;
+  font-size:0.8rem;
+}
+.products-table th,
+.products-table td{
+  border:1px solid #e5e7eb;
+  padding:4px;
+}
+.products-table th{
+  background:#e5f2ff;
+  font-weight:600;
+  white-space:nowrap;
+}
+.products-table input{
+  width:100%;
+  border-radius:4px;
+  border:1px solid #d1d5db;
+  padding:4px;
+  font-size:0.78rem;
+}
+.signature-box{
+  margin-top:10px;
+}
+.signature-box canvas{
+  width:100%;
+  max-width:320px;
+  height:140px;
+  border:1px dashed #9ca3af;
+  border-radius:10px;
+  background:#ffffff;
+}
+.signature-actions{
+  display:flex;
+  gap:8px;
+  margin-top:4px;
+}
+.signature-hint{
+  font-size:0.74rem;
+  color:#6b7280;
+}
+.photo-row{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  margin-bottom:8px;
+}
+.photo-row input[type="file"]{
+  flex:1 1 140px;
+}
+.photo-row input[type="text"]{
+  flex:2 1 200px;
+  border-radius:8px;
+  border:1px solid #d1d5db;
+  padding:7px 9px;
+  font-size:0.8rem;
+}
+.footer-note{
+  margin-top:10px;
+  font-size:0.75rem;
+  color:#6b7280;
+}
+@media(max-width:900px){
+  .grid{grid-template-columns:minmax(0,1fr);}
+}
+</style>
+</head>
+<body>
+  <div class="header">
+    <a href="/operator/dashboard"><i class="fa-solid fa-arrow-left"></i></a>
+    <div class="header-title">
+      <h3>Reporte #${r.id} · ${r.title}</h3>
+      <small>
+        Estado:
+        <span class="badge-status ${
+          r.status === "process"
+            ? "badge-process"
+            : r.status === "closed"
+            ? "badge-closed"
+            : "badge-active"
+        }">${statusLabel}</span>
+      </small>
+    </div>
+    <button type="button" class="btn btn-outline" disabled>
+      Folio ${r.id}
+    </button>
+  </div>
+
+  <div class="container">
+    <div class="grid">
+      <!-- COLUMNA IZQUIERDA: INFO GENERAL + CONTROLES -->
+      <div class="card">
+        <h4><i class="fa-solid fa-circle-info"></i> Detalles generales</h4>
+        <div class="row">
+          <div>
+            <div class="label">Cliente</div>
+            <div class="value">${clientName}</div>
+          </div>
+          <div>
+            <div class="label">Correo cliente</div>
+            <div class="value">${clientEmail}</div>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="label">Teléfono cliente</div>
+            <div class="value">${clientPhone}</div>
+          </div>
+          <div>
+            <div class="label">Dirección</div>
+            <div class="value">${clientAddress}</div>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="label">Creado</div>
+            <div class="value">${formatDate(r.created_at)}</div>
+          </div>
+          <div>
+            <div class="label">Operador asignado</div>
+            <div class="value">${opInfo}</div>
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <div class="label">Inicio de trabajo</div>
+            <div class="value">
+              ${
+                r.work_started_at
+                  ? formatDate(r.work_started_at)
+                  : "Aún no iniciado"
+              }
+            </div>
+          </div>
+          <div>
+            <div class="label">Tiempo total registrado</div>
+            <div class="value">${workedTotal}</div>
+          </div>
+        </div>
+
+        <p style="margin-top:8px;font-size:0.83rem;color:#4b5563;">
+          ${r.description || "Sin descripción."}
+        </p>
+
+        ${
+          adminAssetsHtml
+            ? `<div style="margin-top:8px; display:flex; flex-wrap:wrap; gap:5px;">${adminAssetsHtml}</div>`
+            : ""
+        }
+
+        <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">
+          <span class="badge-time">
+            <i class="fa-solid fa-clock"></i>
+            Tiempo de trabajo:
+            <span 
+              id="workTimer" 
+              class="timer" 
+              data-start="${workStartedMs}" 
+              data-total="${workedTotal}" 
+              data-closed="${isClosed ? "1" : "0"}">
+              ${
+                isClosed
+                  ? workedTotal
+                  : r.work_started_at
+                  ? "--:--:--"
+                  : "00:00:00"
+              }
+            </span>
+          </span>
+        </div>
+
+        <div class="btn-bar">
+          ${
+            !r.operator_id && r.status === "active"
+              ? `
+            <form action="/operator/dashboard/report/${r.id}/take" method="POST">
+              <button class="btn btn-primary"><i class="fa-solid fa-hand"></i> Tomar reporte</button>
+            </form>
+          `
+              : ""
+          }
+
+          ${
+            canStart
+              ? `
+            <form action="/operator/dashboard/report/${r.id}/start-work" method="POST">
+              <button class="btn btn-primary"><i class="fa-solid fa-play"></i> Comenzar trabajo</button>
+            </form>
+          `
+              : ""
+          }
+
+          ${
+            canRelease
+              ? `
+            <form action="/operator/dashboard/report/${r.id}/release" method="POST">
+              <button class="btn btn-warning"><i class="fa-solid fa-arrow-rotate-left"></i> Rechazar / liberar</button>
+            </form>
+          `
+              : ""
+          }
+
+          ${
+            canClose
+              ? `
+            <form action="/operator/dashboard/report/${r.id}/close" method="POST">
+              <button class="btn btn-danger"><i class="fa-solid fa-check-circle"></i> Marcar como finalizado</button>
+            </form>
+          `
+              : ""
+          }
+        </div>
+
+        <p class="footer-note">
+          💡 Flujo recomendado: tomar reporte → comenzar trabajo (activa contador) → llenar formulario de servicio y fotográfico → firmar y generar PDF → marcar como finalizado.
+        </p>
+      </div>
+
+      <!-- COLUMNA DERECHA: FORMULARIOS PDF -->
+      <div class="card">
+        <h4><i class="fa-solid fa-file-pdf"></i> Reporte de servicio (PDF)</h4>
+        ${servicePdfHtml || ""}
+        <form id="serviceForm" action="/operator/dashboard/report/${r.id}/service-pdf" method="POST">
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Nombre del cliente</label>
+              <input type="text" name="client_name" value="${clientName}" required>
+            </div>
+            <div class="form-group">
+              <label>Dirección del cliente</label>
+              <input type="text" name="client_address" value="${clientAddress}">
+            </div>
+            <div class="form-group">
+              <label>Correo del cliente</label>
+              <input type="email" name="client_email" value="${clientEmail}">
+            </div>
+            <div class="form-group">
+              <label>Teléfono del cliente</label>
+              <input type="text" name="client_phone" value="${clientPhone}">
+            </div>
+          </div>
+
+          <div class="form-grid">
+            <div class="form-group">
+              <label>Fecha del servicio</label>
+              <input type="date" name="fecha" value="">
+            </div>
+            <div class="form-group">
+              <label>Hora de inicio</label>
+              <input type="time" name="hora_inicio">
+            </div>
+            <div class="form-group">
+              <label>Hora de término</label>
+              <input type="time" name="hora_termino">
+            </div>
+            <div class="form-group">
+              <label>Tipo de visita</label>
+              <input type="text" name="tipo_visita" placeholder="Fumigación, inspección, etc.">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label>Plagas a controlar</label>
+            <textarea name="plagas" placeholder="Ej: 1. Roedores rastreros&#10;2. Cucarachas..."></textarea>
+          </div>
+
+          <div class="form-group">
+            <label>Áreas a cubrir</label>
+            <div id="areasList" class="tag-list"></div>
+            <button type="button" class="btn-chip" onclick="addTagInput('areasList','areas[]','Área a cubrir')">
+              <i class="fa-solid fa-plus"></i> Añadir área
+            </button>
+          </div>
+
+          <div class="form-group">
+            <label>Actividades realizadas</label>
+            <div id="actsList" class="tag-list"></div>
+            <button type="button" class="btn-chip" onclick="addTagInput('actsList','actividades[]','Descripción de actividad')">
+              <i class="fa-solid fa-plus"></i> Añadir actividad
+            </button>
+          </div>
+
+          <div class="form-group">
+            <label>Deficiencias (si aplica)</label>
+            <div id="defList" class="tag-list"></div>
+            <button type="button" class="btn-chip" onclick="addTagInput('defList','deficiencias[]','Deficiencia observada')">
+              <i class="fa-solid fa-plus"></i> Añadir deficiencia
+            </button>
+          </div>
+
+          <div class="form-group">
+            <label>Recomendaciones</label>
+            <div id="recList" class="tag-list"></div>
+            <button type="button" class="btn-chip" onclick="addTagInput('recList','recomendaciones[]','Recomendación para el cliente')">
+              <i class="fa-solid fa-plus"></i> Añadir recomendación
+            </button>
+          </div>
+
+          <div class="form-group">
+            <label>Productos utilizados</label>
+            <div class="table-scroll">
+              <table class="products-table" id="prodTable">
+                <thead>
+                  <tr>
+                    <th>Producto</th>
+                    <th>Laboratorio</th>
+                    <th>Ingrediente activo</th>
+                    <th>Dosis recom.</th>
+                    <th>Dosis aplicada</th>
+                    <th>Área</th>
+                    <th>Tratamiento</th>
+                    <th>Más info</th>
+                  </tr>
+                </thead>
+                <tbody id="prodBody">
+                </tbody>
+              </table>
+            </div>
+            <button type="button" class="btn-chip" onclick="addProductRow()">
+              <i class="fa-solid fa-plus"></i> Añadir producto
+            </button>
+          </div>
+
+          <div class="signature-box">
+            <label>Firma del técnico / operador</label>
+            <canvas id="sigCanvas"></canvas>
+            <div class="signature-actions">
+              <button type="button" class="btn-chip" onclick="clearSignature()">
+                <i class="fa-solid fa-eraser"></i> Limpiar firma
+              </button>
+            </div>
+            <p class="signature-hint">
+              Firma con el dedo (móvil) o con el mouse. Esta firma se insertará en el PDF del reporte de servicio.
+            </p>
+            <input type="hidden" name="firma_operador" id="sigData">
+          </div>
+
+          <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;">
+            <button class="btn btn-primary" type="submit">
+              <i class="fa-solid fa-file-export"></i> Generar / actualizar PDF de servicio
+            </button>
+          </div>
+
+          <p class="footer-note">
+            El PDF incluirá logo, datos del cliente, horarios, plagas, actividades, productos, recomendaciones, datos del técnico y la firma.
+            La dirección indicada por el técnico se mostrará en el pie del documento junto al teléfono de contacto.
+          </p>
+        </form>
+
+        <hr style="margin:14px 0;border:none;border-top:1px dashed #d1d5db;">
+
+        <h4><i class="fa-solid fa-camera"></i> Reporte fotográfico (PDF)</h4>
+        ${
+          photoPdfsHtml
+            ? `<div style="margin-bottom:8px;">${photoPdfsHtml}</div>`
+            : ""
+        }
+
+        <form id="photoForm" action="/operator/dashboard/report/${r.id}/photo-pdf" method="POST" enctype="multipart/form-data">
+          <div id="photosContainer"></div>
+          <button type="button" class="btn-chip" onclick="addPhotoRow()">
+            <i class="fa-solid fa-plus"></i> Añadir foto
+          </button>
+
+          <div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:8px;">
+            <button class="btn btn-primary" type="submit">
+              <i class="fa-solid fa-file-image"></i> Generar nuevo PDF fotográfico
+            </button>
+          </div>
+
+          <p class="footer-note">
+            Cada envío generará un PDF fotográfico adicional para este mismo reporte.  
+            Cada página del PDF contendrá hasta 4 fotos (2 x 2). Si hay más de 4, se crearán páginas adicionales.
+          </p>
+        </form>
+      </div>
+    </div>
+  </div>
+
+<script>
+// ====== TIMER EN TIEMPO REAL ======
+(function(){
+  var el = document.getElementById('workTimer');
+  if (!el) return;
+  var start = parseInt(el.dataset.start || "0", 10);
+  var closed = el.dataset.closed === "1";
+  var total = el.dataset.total || "00:00:00";
+
+  if (!start || closed) {
+    el.textContent = total;
+    return;
+  }
+
+  function tick() {
+    var diff = Date.now() - start;
+    if (diff < 0) diff = 0;
+    var secs = Math.floor(diff / 1000);
+    var h = String(Math.floor(secs / 3600)).padStart(2,'0');
+    var m = String(Math.floor((secs % 3600) / 60)).padStart(2,'0');
+    var s = String(secs % 60).padStart(2,'0');
+    el.textContent = h + ":" + m + ":" + s;
+  }
+  tick();
+  setInterval(tick, 1000);
+})();
+
+// ====== LISTAS DINÁMICAS (ÁREAS / ACTIVIDADES / DEFICIENCIAS / RECOMENDACIONES) ======
+function addTagInput(containerId, name, placeholder) {
+  var c = document.getElementById(containerId);
+  if (!c) return;
+  var item = document.createElement('div');
+  item.className = 'tag-item';
+  var input = document.createElement('input');
+  input.name = name;
+  input.placeholder = placeholder || '';
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn-chip';
+  btn.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+  btn.onclick = function(){ c.removeChild(item); };
+  item.appendChild(input);
+  item.appendChild(btn);
+  c.appendChild(item);
+}
+
+// Añadimos 1 por defecto a cada lista
+addTagInput('areasList','areas[]','Área a cubrir');
+addTagInput('actsList','actividades[]','Descripción de actividad');
+addTagInput('defList','deficiencias[]','Deficiencia observada');
+addTagInput('recList','recomendaciones[]','Recomendación para el cliente');
+
+// ====== TABLA DE PRODUCTOS ======
+function addProductRow() {
+  var tbody = document.getElementById('prodBody');
+  if (!tbody) return;
+  var tr = document.createElement('tr');
+  var cols = [
+    'prod_nombre[]',
+    'prod_laboratorio[]',
+    'prod_ingrediente[]',
+    'prod_dosis_rec[]',
+    'prod_dosis_apl[]',
+    'prod_area[]',
+    'prod_tratamiento[]',
+    'prod_info[]'
+  ];
+  cols.forEach(function(name){
+    var td = document.createElement('td');
+    var input = document.createElement('input');
+    input.name = name;
+    td.appendChild(input);
+    tr.appendChild(td);
+  });
+  tbody.appendChild(tr);
+}
+addProductRow();
+
+// ====== FIRMA (CANVAS) ======
+(function(){
+  var canvas = document.getElementById('sigCanvas');
+  if (!canvas) return;
+  var input = document.getElementById('sigData');
+  var ctx = canvas.getContext('2d');
+  ctx.strokeStyle = '#111827';
+  ctx.lineWidth = 2;
+
+  var drawing = false;
+
+  function pos(evt){
+    var rect = canvas.getBoundingClientRect();
+    var e = evt.touches ? evt.touches[0] : evt;
+    return {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  }
+
+  function start(evt){
+    evt.preventDefault();
+    drawing = true;
+    var p = pos(evt);
+    ctx.beginPath();
+    ctx.moveTo(p.x, p.y);
+  }
+
+  function move(evt){
+    if (!drawing) return;
+    evt.preventDefault();
+    var p = pos(evt);
+    ctx.lineTo(p.x, p.y);
+    ctx.stroke();
+  }
+
+  function end(evt){
+    if (!drawing) return;
+    drawing = false;
+    try {
+      input.value = canvas.toDataURL('image/png');
+    } catch(e){}
+  }
+
+  canvas.addEventListener('mousedown', start);
+  canvas.addEventListener('mousemove', move);
+  canvas.addEventListener('mouseup', end);
+  canvas.addEventListener('mouseleave', end);
+
+  canvas.addEventListener('touchstart', start, {passive:false});
+  canvas.addEventListener('touchmove', move, {passive:false});
+  canvas.addEventListener('touchend', end);
+
+  window.clearSignature = function(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    input.value = '';
+  };
+})();
+
+// ====== FOTOS DINÁMICAS ======
+function addPhotoRow() {
+  var c = document.getElementById('photosContainer');
+  if (!c) return;
+  var row = document.createElement('div');
+  row.className = 'photo-row';
+
+  var file = document.createElement('input');
+  file.type = 'file';
+  file.name = 'photos';
+  file.accept = 'image/*';
+
+  var text = document.createElement('input');
+  text.type = 'text';
+  text.name = 'photo_captions[]';
+  text.placeholder = 'Breve descripción de la foto';
+
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'btn-chip';
+  btn.innerHTML = '<i class="fa-solid fa-xmark"></i>';
+  btn.onclick = function(){ c.removeChild(row); };
+
+  row.appendChild(file);
+  row.appendChild(text);
+  row.appendChild(btn);
+  c.appendChild(row);
+}
+addPhotoRow();
+</script>
+</body>
+</html>`);
+});
+
+// ================================================
+// 3) ACCIONES OPERADOR
+// ================================================
+
+// Tomar un reporte (ACTIVO -> EN PROCESO y asigna operador)
+router.post("/report/:id/take", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+
+  if (r.status !== "active" || r.operator_id) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  db.prepare(
+    "UPDATE work_reports SET operator_id = ?, status = 'process' WHERE id = ?",
+  ).run(user.id, id);
+
+  res.redirect("/operator/dashboard/report/" + id);
+});
+
+// Comenzar trabajo (marca fecha/hora real de inicio)
+router.post("/report/:id/start-work", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+
+  if (r.operator_id !== user.id || r.status !== "process" || r.work_started_at) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  db.prepare(
+    "UPDATE work_reports SET work_started_at = datetime('now') WHERE id = ?",
+  ).run(id);
+
+  res.redirect("/operator/dashboard/report/" + id);
+});
+
+// Liberar reporte (vuelve a ACTIVO, sin operador, limpia inicio de trabajo)
+router.post("/report/:id/release", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+
+  if (r.operator_id !== user.id || r.status !== "process") {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  db.prepare(
+    "UPDATE work_reports SET operator_id = NULL, status = 'active', work_started_at = NULL, work_seconds_total = NULL WHERE id = ?",
+  ).run(id);
+
+  res.redirect("/operator/dashboard/report/" + id);
+});
+
+// Finalizar reporte (calcula tiempo total)
+router.post("/report/:id/close", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+
+  if (r.operator_id !== user.id || r.status !== "process") {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  let totalSeconds = r.work_seconds_total || 0;
+  if (r.work_started_at) {
+    const started = new Date(r.work_started_at);
+    const now = new Date();
+    const diff = Math.floor((now - started) / 1000);
+    if (diff > 0) totalSeconds = diff;
+  }
+
+  db.prepare(
+    "UPDATE work_reports SET status = 'closed', completed_at = datetime('now'), work_seconds_total = ? WHERE id = ?",
+  ).run(totalSeconds, id);
+
+  res.redirect("/operator/dashboard/report/" + id);
+});
+
+// Eliminar PDF de servicio
+router.post("/report/:id/service-pdf/delete", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+  if (r.operator_id !== user.id) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  if (r.service_pdf_url) {
+    const filename = r.service_pdf_url.split("/").pop();
+    const pdfDir = path.join(__dirname, "uploads", "pdfs");
+    const filePath = path.join(pdfDir, filename);
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        console.error("Error al eliminar PDF de servicio:", e.message);
+      }
+    }
+  }
+
+  db.prepare(
+    "UPDATE work_reports SET service_pdf_url = NULL, service_form = NULL WHERE id = ?",
+  ).run(id);
+
+  res.redirect("/operator/dashboard/report/" + id);
+});
+
+// Eliminar un PDF fotográfico (por índice)
+router.post("/report/:id/photo-pdf/delete", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const index = parseInt(req.body.index || "0", 10);
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+  if (r.operator_id !== user.id) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  let arr = [];
+  try {
+    arr = JSON.parse(r.photo_pdfs || "[]");
+    if (!Array.isArray(arr)) arr = [];
+  } catch {
+    arr = [];
+  }
+
+  if (index >= 0 && index < arr.length) {
+    const url = arr[index];
+    const filename = url.split("/").pop();
+    const pdfDir = path.join(__dirname, "uploads", "pdfs");
+    const filePath = path.join(pdfDir, filename);
+    if (fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch (e) {
+        console.error("Error al eliminar PDF fotográfico:", e.message);
+      }
+    }
+    arr.splice(index, 1);
+    db.prepare(
+      "UPDATE work_reports SET photo_pdfs = ? WHERE id = ?",
+    ).run(JSON.stringify(arr), id);
+  }
+
+  res.redirect("/operator/dashboard/report/" + id);
+});
+
+// Generar / actualizar PDF de servicio
+router.post("/report/:id/service-pdf", (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+  if (r.operator_id !== user.id) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  // ----------------------------------------------------------
+  // CARGAMOS DATOS DEL OPERADOR (nombre + correo) PARA EL PDF
+  // ----------------------------------------------------------
+  let opName = "";
+  let opEmail = "";
+  try {
+    const op = db
+      .prepare("SELECT name, surname, email FROM users WHERE id = ?")
+      .get(r.operator_id);
+    if (op) {
+      opName = `${op.name} ${op.surname || ""}`.trim();
+      opEmail = op.email || "";
+    }
+  } catch (e) {
+    console.error("Error cargando operador para PDF servicio:", e.message);
+  }
+
+  const body = req.body;
+
+  // Datos que se guardan en service_form (JSON)
+  const data = {
+    client_name: body.client_name || "",
+    client_address: body.client_address || "",
+    client_email: body.client_email || "",
+    client_phone: body.client_phone || "",
+    fecha: body.fecha || "",
+    hora_inicio: body.hora_inicio || "",
+    hora_termino: body.hora_termino || "",
+    tipo_visita: body.tipo_visita || "",
+    plagas: body.plagas || "",
+    areas: toArray(body["areas[]"] || body.areas),
+    actividades: toArray(body["actividades[]"] || body.actividades),
+    deficiencias: toArray(body["deficiencias[]"] || body.deficiencias),
+    recomendaciones: toArray(
+      body["recomendaciones[]"] || body.recomendaciones,
+    ),
+    productos: [],
+  };
+
+  // Productos del formulario
+  const nombres = toArray(body["prod_nombre[]"] || body.prod_nombre);
+  const labs = toArray(body["prod_laboratorio[]"] || body.prod_laboratorio);
+  const ing = toArray(body["prod_ingrediente[]"] || body.prod_ingrediente);
+  const dosisRec = toArray(body["prod_dosis_rec[]"] || body.prod_dosis_rec);
+  const dosisApl = toArray(body["prod_dosis_apl[]"] || body.prod_dosis_apl);
+  const areasProd = toArray(body["prod_area[]"] || body.prod_area);
+  const trat = toArray(body["prod_tratamiento[]"] || body.prod_tratamiento);
+  const info = toArray(body["prod_info[]"] || body.prod_info);
+
+  const maxLen = Math.max(
+    nombres.length,
+    labs.length,
+    ing.length,
+    dosisRec.length,
+    dosisApl.length,
+    areasProd.length,
+    trat.length,
+    info.length,
+  );
+
+  for (let i = 0; i < maxLen; i++) {
+    if (!nombres[i]) continue;
+    data.productos.push({
+      nombre: nombres[i] || "",
+      laboratorio: labs[i] || "",
+      ingrediente: ing[i] || "",
+      dosis_rec: dosisRec[i] || "",
+      dosis_apl: dosisApl[i] || "",
+      area: areasProd[i] || "",
+      tratamiento: trat[i] || "",
+      info: info[i] || "",
+    });
+  }
+
+  // Firma operador (se guarda como PNG en uploads/signatures)
+  let sigImagePath = null;
+  const sigData = body.firma_operador || "";
+  if (sigData && sigData.startsWith("data:image/png;base64,")) {
+    const sigDir = path.join(__dirname, "uploads", "signatures");
+    ensureDir(sigDir);
+    const sigName = `firma_op_${id}_${Date.now()}.png`;
+    sigImagePath = path.join(sigDir, sigName);
+    const base64 = sigData.replace(/^data:image\/png;base64,/, "");
+    fs.writeFileSync(sigImagePath, base64, "base64");
+  }
+
+  getLogoBuffer((_, logoBuffer) => {
+    const pdfDir = path.join(__dirname, "uploads", "pdfs");
+    ensureDir(pdfDir);
+    const pdfName = `servicio_${id}_${Date.now()}.pdf`;
+    const pdfPath = path.join(pdfDir, pdfName);
+    const pdfUrl = "/uploads/pdfs/" + pdfName;
+
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const stream = fs.createWriteStream(pdfPath);
+    doc.pipe(stream);
+
+    const pageWidth = doc.page.width;
+    const pageHeight = doc.page.height;
+
+    // HEADER ESTILO KAIROS
+    doc.rect(0, 0, pageWidth, 70).fill("#0b3b2e");
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, 45, 15, { fit: [120, 40] });
+      } catch (e) {
+        console.error("Error dibujando logo en PDF servicio:", e.message);
+      }
+    }
+    doc
+      .fillColor("#ffffff")
+      .fontSize(18)
+      .text("kairos Pest Control", 0, 18, { align: "center" });
+    doc.fontSize(12).text("Reporte de Servicio", { align: "center" });
+
+    // Caja Folio + EMERGENCIAS (rojo)
+    const boxWidth = 95;
+    const boxHeight = 18;
+    const boxX = pageWidth - boxWidth - 40;
+    const folioY = 18;
+    const emerY = folioY + boxHeight + 6;
+
+    doc.save();
+    doc
+      .roundedRect(boxX, folioY, boxWidth, boxHeight, 4)
+      .fill("#b91c1c");
+    doc
+      .fillColor("#ffffff")
+      .fontSize(10)
+      .text(`Folio ${id}`, boxX, folioY + 4, {
+        width: boxWidth,
+        align: "center",
+      });
+
+    doc
+      .roundedRect(boxX, emerY, boxWidth, boxHeight, 4)
+      .fill("#b91c1c");
+    doc
+      .fillColor("#ffffff")
+      .fontSize(9)
+      .text("EMERGENCIAS", boxX, emerY + 4, {
+        width: boxWidth,
+        align: "center",
+      });
+    doc.restore();
+
+    // Volver a estilo normal
+    doc.moveDown();
+    doc.y = 80;
+    doc.fillColor("#111827").fontSize(10);
+
+    const sectionTitle = (label) => {
+      const x = 40;
+      const width = pageWidth - 80;
+      const y = doc.y + 2;
+      doc.save();
+      doc.rect(x, y - 4, width, 16).fill("#14532d");
+      doc.fillColor("#ffffff").fontSize(10).text(label, x + 6, y - 2);
+      doc.restore();
+      doc.moveDown(1);
+      doc.fillColor("#111827").fontSize(10);
+    };
+
+    // DATOS DEL CLIENTE
+    sectionTitle("Datos del cliente");
+    let yStart = doc.y;
+    doc.text(`Cliente: ${data.client_name || "-"}`, 40, yStart);
+    doc.text(`Teléfono: ${data.client_phone || "-"}`, pageWidth / 2, yStart);
+    yStart = doc.y + 2;
+    doc.text(`Dirección: ${data.client_address || "-"}`, 40, yStart);
+    doc.text(`Correo: ${data.client_email || "-"}`, pageWidth / 2, yStart);
+
+    // DETALLES DEL SERVICIO
+    doc.moveDown(1);
+    sectionTitle("Detalles del servicio");
+    doc.text(`Fecha: ${data.fecha || "-"}`, 40);
+    doc.text(
+      `Hora de inicio: ${data.hora_inicio || "-"}   ·   Hora de término: ${
+        data.hora_termino || "-"
+      }`,
+      40,
+    );
+    doc.text(`Tipo de visita: ${data.tipo_visita || "-"}`, 40);
+
+    // PLAGAS A CONTROLAR (en columna, una debajo de otra)
+    doc.moveDown(0.6);
+    doc.fontSize(10).text("Plagas a controlar", 40);
+    if (data.plagas && String(data.plagas).trim() !== "") {
+      const lines = String(data.plagas)
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length) {
+        lines.forEach((l) => doc.text(l, 40));
+      } else {
+        doc.text("N/A", 40);
+      }
+    } else {
+      doc.text("N/A", 40);
+    }
+
+    // ÁREAS A CUBRIR
+    doc.moveDown(0.8);
+    sectionTitle("Áreas a cubrir");
+    if (data.areas.length) {
+      data.areas.forEach((a, i) => doc.text(`${i + 1}. ${a}`, 40));
+    } else {
+      doc.text("N/A", 40);
+    }
+
+    // PRODUCTOS UTILIZADOS
+    if (data.productos.length) {
+      doc.moveDown(0.8);
+      sectionTitle("Productos utilizados");
+      data.productos.forEach((p, i) => {
+        doc.moveDown(0.2);
+        doc.text(`${i + 1}. Producto: ${p.nombre || "-"}`, 40);
+        if (p.laboratorio)
+          doc.text(`   Laboratorio: ${p.laboratorio}`, 40);
+        if (p.ingrediente)
+          doc.text(`   Ingrediente activo: ${p.ingrediente}`, 40);
+        if (p.dosis_rec || p.dosis_apl) {
+          doc.text(
+            `   Dosis recom.: ${p.dosis_rec || "-"} · Dosis aplicada: ${
+              p.dosis_apl || "-"
+            }`,
+            40,
+          );
+        }
+        if (p.area) doc.text(`   Área: ${p.area}`, 40);
+        if (p.tratamiento) doc.text(`   Tratamiento: ${p.tratamiento}`, 40);
+        if (p.info) doc.text(`   Más información: ${p.info}`, 40);
+      });
+    }
+
+    // ACTIVIDADES
+    doc.moveDown(0.8);
+    sectionTitle("Actividades realizadas");
+    if (data.actividades.length) {
+      data.actividades.forEach((a, i) => doc.text(`${i + 1}. ${a}`, 40));
+    } else {
+      doc.text("N/A", 40);
+    }
+
+    // DEFICIENCIAS
+    doc.moveDown(0.8);
+    sectionTitle("Deficiencias");
+    if (data.deficiencias.length) {
+      data.deficiencias.forEach((a, i) => doc.text(`${i + 1}. ${a}`, 40));
+    } else {
+      doc.text("N/A", 40);
+    }
+
+    // RECOMENDACIONES
+    doc.moveDown(0.8);
+    sectionTitle("Recomendaciones");
+    if (data.recomendaciones.length) {
+      data.recomendaciones.forEach((a, i) => doc.text(`${i + 1}. ${a}`, 40));
+    } else {
+      doc.text("N/A", 40);
+    }
+
+    // FIRMAS + DATOS TÉCNICO / CLIENTE
+    doc.moveDown(1);
+    sectionTitle("Firmas");
+    const sigY = doc.y + 4;
+    doc.text(`Firma técnico: ${opName || ""}`, 40, sigY);
+    if (sigImagePath) {
+      try {
+        doc.image(sigImagePath, 120, sigY - 10, { fit: [150, 60] });
+      } catch (e) {
+        console.error("Error dibujando firma en PDF servicio:", e.message);
+      }
+    }
+    const clientSigX = pageWidth / 2 + 40;
+    doc.text("Firma cliente:", clientSigX, sigY);
+    doc.text("__________________________", clientSigX, sigY + 25);
+
+    // Correos y nombres debajo
+    const infoY = sigY + 70;
+    doc.text(`Correo técnico: ${opEmail || "-"}`, 40, infoY);
+    doc.text(`Correo cliente: ${data.client_email || "-"}`, clientSigX, infoY);
+    doc.text(opName || "-", 40, infoY + 18);
+    doc.text(data.client_name || "-", clientSigX, infoY + 18);
+
+    // Logo pequeño al centro encima del footer
+    if (logoBuffer) {
+      try {
+        doc.image(logoBuffer, pageWidth / 2 - 40, infoY + 10, {
+          fit: [80, 40],
+        });
+      } catch (e) {
+        console.error("Error dibujando logo inferior en PDF servicio:", e.message);
+      }
+    }
+
+    // FOOTER (usa SIEMPRE la dirección que puso el técnico)
+    const footerHeight = 55;
+    const footerY = pageHeight - footerHeight;
+    doc.save();
+    doc.rect(0, footerY, pageWidth, footerHeight).fill("#064e3b");
+    doc
+      .fillColor("#ffffff")
+      .fontSize(9)
+      .text(
+        data.client_address || "Dirección del servicio no indicada",
+        40,
+        footerY + 8,
+        { align: "center" },
+      );
+    doc.text("Licencia Sanitaria", { align: "center" });
+    doc.text("Tel: +507 6695-4293", { align: "center" });
+    doc.restore();
+
+    doc.end();
+
+    stream.on("finish", () => {
+      // IMPORTANTE: solo guardamos service_form y service_pdf_url.
+      // NO existe columna client_address en work_reports, se queda en el JSON.
+      db.prepare(
+        "UPDATE work_reports SET service_form = ?, service_pdf_url = ? WHERE id = ?",
+      ).run(
+        JSON.stringify(data),
+        pdfUrl,
+        id,
+      );
+
+      res.redirect("/operator/dashboard/report/" + id);
+    });
+  });
+});
+
+// Generar reporte fotográfico
+router.post("/report/:id/photo-pdf", async (req, res) => {
+  const user = req.session.user;
+  const id = req.params.id;
+  const r = db.prepare("SELECT * FROM work_reports WHERE id = ?").get(id);
+  if (!r) return res.status(404).send("Reporte no encontrado");
+  if (r.operator_id !== user.id) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  let files = [];
+  if (req.files && req.files.photos) {
+    files = Array.isArray(req.files.photos)
+      ? req.files.photos
+      : [req.files.photos];
+  }
+  const captions = toArray(
+    req.body["photo_captions[]"] || req.body.photo_captions,
+  );
+
+  if (!files.length) {
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  const photosDir = path.join(__dirname, "uploads", "photos");
+  const pdfDir = path.join(__dirname, "uploads", "pdfs");
+  ensureDir(photosDir);
+  ensureDir(pdfDir);
+
+  const localPaths = [];
+
+  // Guardamos las fotos en disco (usa express-fileupload: f.mv)
+  try {
+    await Promise.all(
+      files.map((f) => {
+        const name = Date.now() + "_" + f.name.replace(/\s+/g, "_");
+        const fp = path.join(photosDir, name);
+        localPaths.push(fp);
+        return new Promise((resolve, reject) => {
+          f.mv(fp, (err) => (err ? reject(err) : resolve()));
+        });
+      }),
+    );
+  } catch (e) {
+    console.error("Error moviendo fotos para PDF:", e.message);
+    return res.redirect("/operator/dashboard/report/" + id);
+  }
+
+  // Dirección del servicio:
+  // 1) Preferimos lo que se guardó en service_form (lo que puso el técnico)
+  // 2) Si no existe, mostramos mensaje genérico.
+  let clientAddress = "";
+  try {
+    const sf = r.service_form ? JSON.parse(r.service_form) : null;
+    if (sf && sf.client_address) clientAddress = sf.client_address;
+  } catch {
+    // ignore
+  }
+  if (!clientAddress) {
+    clientAddress = "Dirección del servicio no indicada";
+  }
+
+  getLogoBuffer((_, logoBuffer) => {
+    const pdfName = `fotos_${id}_${Date.now()}.pdf`;
+    const pdfPath = path.join(pdfDir, pdfName);
+    const pdfUrl = "/uploads/pdfs/" + pdfName;
+
+    const doc = new PDFDocument({ size: "A4", margin: 40 });
+    const stream = fs.createWriteStream(pdfPath);
+    doc.pipe(stream);
+
+    const renderFrame = () => {
+      const pageWidth = doc.page.width;
+      const pageHeight = doc.page.height;
+
+      // HEADER
+      doc.rect(0, 0, pageWidth, 65).fill("#0b3b2e");
+      if (logoBuffer) {
+        try {
+          doc.image(logoBuffer, 45, 15, { fit: [110, 35] });
+        } catch (e) {
+          console.error("Error dibujando logo en PDF fotos:", e.message);
+        }
+      }
+      doc
+        .fillColor("#ffffff")
+        .fontSize(16)
+        .text("kairos Pest Control", 0, 18, { align: "center" });
+      doc.fontSize(12).text("Reporte Fotográfico", { align: "center" });
+
+      // Folio + EMERGENCIAS
+      const boxWidth = 95;
+      const boxHeight = 18;
+      const boxX = pageWidth - boxWidth - 40;
+      const folioY = 18;
+      const emerY = folioY + boxHeight + 6;
+
+      doc.save();
+      doc
+        .roundedRect(boxX, folioY, boxWidth, boxHeight, 4)
+        .fill("#b91c1c");
+      doc
+        .fillColor("#ffffff")
+        .fontSize(10)
+        .text(`Folio ${id}`, boxX, folioY + 4, {
+          width: boxWidth,
+          align: "center",
+        });
+
+      doc
+        .roundedRect(boxX, emerY, boxWidth, boxHeight, 4)
+        .fill("#b91c1c");
+      doc
+        .fillColor("#ffffff")
+        .fontSize(9)
+        .text("EMERGENCIAS", boxX, emerY + 4, {
+          width: boxWidth,
+          align: "center",
+        });
+      doc.restore();
+
+      doc.moveTo(40, 80).lineTo(pageWidth - 40, 80).stroke("#d1d5db");
+
+      // FOOTER
+      const footerHeight = 55;
+      const footerY = pageHeight - footerHeight;
+      doc.save();
+      doc.rect(0, footerY, pageWidth, footerHeight).fill("#064e3b");
+      doc
+        .fillColor("#ffffff")
+        .fontSize(9)
+        .text(clientAddress, 40, footerY + 10, {
+          align: "center",
+        });
+      doc.text("Licencia Sanitaria", { align: "center" });
+      doc.text("Tel: +507 6695-4293", { align: "center" });
+      doc.restore();
+    };
+
+    // Parámetros de la grilla 2x2 (4 fotos por página)
+    const pageWidth = doc.page.width;
+    const startX = 40;
+    const endX = pageWidth - 40;
+    const gridWidth = endX - startX;
+    const cols = 2;
+    const rows = 2;
+    const gapX = 20;
+    const gapY = 30;
+    const cellWidth = (gridWidth - gapX) / cols;
+    const imgHeight = 150;
+    const startY = 100;
+
+    localPaths.forEach((fp, idx) => {
+      if (idx % (cols * rows) === 0) {
+        if (idx > 0) doc.addPage();
+        renderFrame();
+      }
+
+      const indexInPage = idx % (cols * rows);
+      const row = Math.floor(indexInPage / cols);
+      const col = indexInPage % cols;
+
+      const x = startX + col * (cellWidth + gapX);
+      const y = startY + row * (imgHeight + gapY);
+
+      // IMAGEN
+      try {
+        const imgBuf = fs.readFileSync(fp);
+        doc.image(imgBuf, x, y, {
+          fit: [cellWidth, imgHeight],
+          align: "center",
+          valign: "center",
+        });
+      } catch (e) {
+        console.error("Error cargando imagen en PDF fotos:", e.message);
+        doc
+          .fontSize(10)
+          .fillColor("#111827")
+          .text("No se pudo cargar la imagen.", x, y + imgHeight / 2, {
+            width: cellWidth,
+            align: "center",
+          });
+      }
+
+      // DESCRIPCIÓN
+      const caption = captions[idx] || "";
+      doc
+        .fontSize(9)
+        .fillColor("#111827")
+        .text(caption || "Sin descripción", x, y + imgHeight + 6, {
+          width: cellWidth,
+          align: "center",
+        });
+    });
+
+    doc.end();
+
+    stream.on("finish", () => {
+      const row = db
+        .prepare("SELECT photo_pdfs FROM work_reports WHERE id = ?")
+        .get(id);
+      let arr = [];
+      try {
+        arr = JSON.parse(row.photo_pdfs || "[]");
+        if (!Array.isArray(arr)) arr = [];
+      } catch {
+        arr = [];
+      }
+      arr.push(pdfUrl);
+      db.prepare(
+        "UPDATE work_reports SET photo_pdfs = ? WHERE id = ?",
+      ).run(JSON.stringify(arr), id);
+
+      res.redirect("/operator/dashboard/report/" + id);
+    });
+  });
+});
+
+module.exports = router;
